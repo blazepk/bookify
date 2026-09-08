@@ -67,10 +67,39 @@ offers **Unhighlight** directly. The editor closes via the ✕, the backdrop,
 
 ![The annotation editor](assets/annotation.png)
 
-Annotations are stored in `annotations.json` next to the book, survive rebuilds,
-and export to Markdown from the Notes panel.
-
 ![The notes panel](assets/notes.png)
+
+### Where your state lives
+
+Notes are kept in **two places at once**, and either one can rebuild the other:
+
+| Store | Scope | Survives |
+|---|---|---|
+| **IndexedDB** (`bookify` database) | the browser origin, partitioned by book id | the output directory being deleted, `~/.cache` being cleared, rebuilds |
+| **`annotations.json`** next to the book | that book's output directory | browser data being cleared, a different port, a different browser, opening the book off disk |
+
+The reason for both: IndexedDB is scoped to an *origin including the port*, so a
+book served on `--serve 9000` is a different database from the same book on
+8123 — and some browsers give `file://` pages no IndexedDB at all. The JSON file
+is port-independent, so it carries your notes across. On every page load the two
+are merged, and the merged result is written back to both.
+
+Each book gets a stable id derived from its source path, so it keeps its own
+rows even when several books share one origin (which is what happens when you
+render different folders on the default port). Renaming with `--title`, moving
+the output, or rebuilding does not change it.
+
+Deletes are recorded as tombstones rather than simply dropped — a missing record
+is indistinguishable from one the other store has not seen yet, so without them
+a deleted note could come back on the next merge. They are pruned after 30 days.
+
+Ask AI conversations are stored too, one thread per passage, so reopening a
+highlight brings the discussion back rather than starting over.
+
+If IndexedDB is unavailable (private windows, site data blocked), bookify falls
+back to `localStorage`, and to the server file alone if that is blocked as well.
+
+Annotations survive rebuilds and export to Markdown from the Notes panel.
 
 ### Ask AI
 
@@ -131,7 +160,7 @@ navigation — arrows page through the book, `/` focuses the filter.
 <out>/
   html/          static site — open index.html
   markdown/      SUMMARY.md (contents), one page per file, BOOK.md (all in one)
-  annotations.json
+  annotations.json   your notes — preserved across rebuilds, mirrored to IndexedDB
 ```
 
 `BOOK.md` is the whole book in a single file, which makes it a convenient blob

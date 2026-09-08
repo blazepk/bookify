@@ -388,6 +388,18 @@ def test_ask(tmp: Path) -> None:
                         "messages": [{"role": "user", "content": "hi"}]})
         check("unknown provider rejected", code == 400)
 
+        # a tombstone stays until it has had time to reach every store, then goes
+        now = time.time() * 1000
+        fresh = {"id": "t-new", "exact": "MARKER_MD", "occ": 0,
+                 "deleted": True, "updated": now}
+        stale = {"id": "t-old", "exact": "MARKER_MD", "occ": 0,
+                 "deleted": True, "updated": now - 400 * 86400 * 1000}
+        _, body = post(s.url + "/__annotations__",
+                       {"merge": {"README.html": [fresh, stale]}})
+        ids = {a["id"] for a in json.loads(body)["pages"].get("README.html", [])}
+        check("a recent tombstone is kept", "t-new" in ids)
+        check("an expired tombstone is pruned", "t-old" not in ids)
+
 
 # ---------------------------------------------------------------- browser suite
 
@@ -449,18 +461,71 @@ def test_browser(tmp: Path) -> None:
         page.wait_for_timeout(700)
 
         def count() -> int:
+            """Live notes on the server. Deletes leave a tombstone behind so the
+            removal can reach every store, and those are not notes."""
             return page.evaluate(
                 "async()=>{const d=await (await fetch('/__annotations__',"
                 "{cache:'no-store'})).json();"
-                "return Object.values(d.pages).reduce((n,l)=>n+l.length,0)}")
+                "return Object.values(d.pages)"
+                ".reduce((n,l)=>n+l.filter(a=>!a.deleted).length,0)}")
+
+        def tombstones() -> int:
+            return page.evaluate(
+                "async()=>{const d=await (await fetch('/__annotations__',"
+                "{cache:'no-store'})).json();"
+                "return Object.values(d.pages)"
+                ".reduce((n,l)=>n+l.filter(a=>a.deleted).length,0)}")
+
+        def painted() -> int:
+            return page.evaluate(
+                "()=>Array.from(CSS.highlights.get('bk-hl')).length"
+                "+Array.from(CSS.highlights.get('bk-note')).length")
+
+        def idb_notes() -> int:
+            return page.evaluate("""async()=>{
+              const d=await new Promise(r=>{const q=indexedDB.open('bookify');
+                q.onsuccess=()=>r(q.result);q.onerror=()=>r(null);q.onblocked=()=>r(null)});
+              if(!d)return -1;
+              if(![...d.objectStoreNames].includes('annotations')){d.close();return -1}
+              const rows=await new Promise(r=>{const tx=d.transaction(['annotations'],'readonly');
+                const rq=tx.objectStore('annotations').getAll();
+                rq.onsuccess=()=>r(rq.result||[]);rq.onerror=()=>r([])});
+              d.close();return rows.filter(a=>!a.deleted).length}""")
+
+        def clear_idb() -> str:
+            # clearing the stores never blocks on the connection the page holds
+            return page.evaluate("""async()=>{
+              const d=await new Promise(r=>{const q=indexedDB.open('bookify');
+                q.onsuccess=()=>r(q.result);q.onerror=()=>r(null);q.onblocked=()=>r(null)});
+              if(!d)return 'no-db';
+              const names=[...d.objectStoreNames]
+                .filter(n=>['annotations','books','chats'].includes(n));
+              if(!names.length){d.close();return 'no-stores'}
+              await new Promise(r=>{const tx=d.transaction(names,'readwrite');
+                for(const n of names)tx.objectStore(n).clear();
+                tx.oncomplete=tx.onerror=tx.onabort=()=>r()});
+              d.close();return 'cleared'}""")
+
+        def wipe_server() -> None:
+            page.evaluate("async()=>{await fetch('/__annotations__',"
+                          "{method:'POST',body:JSON.stringify({pages:{}})})}")
 
         def drag(a: float, b: float) -> None:
-            box = page.locator("main p").first.bounding_box()
+            """Select a run of text in the first paragraph and wait for the
+            toolbar. Clears any leftover selection and scrolls the paragraph
+            into view first, so this does not depend on what ran before."""
+            para = page.locator("main p").first
+            para.scroll_into_view_if_needed()
+            page.evaluate("()=>getSelection().removeAllRanges()")
+            page.wait_for_timeout(60)
+            box = para.bounding_box()
             page.mouse.move(box["x"] + box["width"] * a, box["y"] + 8)
             page.mouse.down()
             page.mouse.move(box["x"] + box["width"] * b, box["y"] + 8, steps=10)
             page.mouse.up()
-            page.wait_for_timeout(280)
+            page.wait_for_function(
+                "()=>document.querySelector('.bk-bar')"
+                ".getBoundingClientRect().height>0", timeout=5000)
 
         drag(0.05, 0.45)
         check("toolbar appears on selection",
@@ -473,11 +538,15 @@ def test_browser(tmp: Path) -> None:
               page.evaluate("()=>document.querySelector('.bk-bar')"
                             ".getBoundingClientRect().height===0"))
 
-        # triple-click selects a paragraph: element-boundary ranges must work
-        page.evaluate("async()=>{await fetch('/__annotations__',"
-                      "{method:'POST',body:JSON.stringify({pages:{}})})}")
+        # triple-click selects a paragraph: element-boundary ranges must work.
+        # Both stores have to be emptied -- clearing only the server file would
+        # leave IndexedDB to restore the note on reload (which it should).
+        wipe_server()
+        clear_idb()
         page.reload()
-        page.wait_for_timeout(600)
+        page.wait_for_timeout(700)
+        check("clearing both stores leaves nothing painted", painted() == 0,
+              f"painted={painted()}")
         box = page.locator("main p").first.bounding_box()
         page.mouse.click(box["x"] + 40, box["y"] + 8, click_count=3)
         page.wait_for_timeout(250)
@@ -550,7 +619,8 @@ def test_browser(tmp: Path) -> None:
         check("answer saves onto the highlight",
               page.evaluate("async()=>{const d=await (await fetch"
                             "('/__annotations__',{cache:'no-store'})).json();"
-                            "const l=d.pages['README.html']||[];"
+                            "const l=(d.pages['README.html']||[])"
+                            ".filter(a=>!a.deleted);"
                             "return l.length===1 && (l[0].note||'').startsWith('AI: ')}"))
         page.keyboard.press("Escape")
         page.wait_for_timeout(350)
@@ -573,6 +643,100 @@ def test_browser(tmp: Path) -> None:
               page.evaluate("()=>[...document.querySelectorAll"
                             "('nav.sidebar li[data-t]')]"
                             ".every(l=>getComputedStyle(l).display!=='none')"))
+
+        # ---- storage durability: IndexedDB and the server file back each other
+        # up, and a delete never comes back ----
+        clear_idb()
+        wipe_server()
+        page.reload()
+        page.wait_for_timeout(700)
+        drag(0.05, 0.45)
+        page.click('.bk-bar button[data-act="hl"]')
+        page.wait_for_timeout(500)
+        check("a note reaches both stores", count() == 1 and idb_notes() == 1,
+              f"server={count()} idb={idb_notes()}")
+
+        wipe_server()
+        page.reload()
+        page.wait_for_timeout(900)
+        check("IndexedDB restores a lost server file",
+              painted() == 1 and count() == 1,
+              f"painted={painted()} server={count()}")
+
+        clear_idb()
+        page.reload()
+        page.wait_for_timeout(900)
+        check("the server file restores a cleared IndexedDB",
+              painted() == 1 and idb_notes() == 1,
+              f"painted={painted()} idb={idb_notes()}")
+
+        pbox = page.locator("main p").first.bounding_box()
+        page.mouse.click(pbox["x"] + pbox["width"] * 0.15, pbox["y"] + 8)
+        page.wait_for_timeout(350)
+        page.click('.bk-pop button[data-act="del"]')
+        page.wait_for_timeout(500)
+        check("a delete is recorded as a tombstone",
+              painted() == 0 and count() == 0 and tombstones() == 1,
+              f"painted={painted()} live={count()} tombs={tombstones()}")
+        clear_idb()
+        page.reload()
+        page.wait_for_timeout(900)
+        check("a deleted note is not resurrected by the other store",
+              painted() == 0, f"painted={painted()}")
+
+        # each book keeps its own rows, keyed by the id built into the page
+        check("annotations are scoped to a book id",
+              page.evaluate("""async()=>{
+                const d=await new Promise(r=>{const q=indexedDB.open('bookify');
+                  q.onsuccess=()=>r(q.result);q.onerror=()=>r(null)});
+                if(!d)return false;
+                const rows=await new Promise(r=>{const tx=d.transaction(['annotations'],'readonly');
+                  const rq=tx.objectStore('annotations').getAll();
+                  rq.onsuccess=()=>r(rq.result||[]);rq.onerror=()=>r([])});
+                const books=await new Promise(r=>{const tx=d.transaction(['books'],'readonly');
+                  const rq=tx.objectStore('books').getAll();
+                  rq.onsuccess=()=>r(rq.result||[]);rq.onerror=()=>r([])});
+                d.close();
+                const id=document.body.dataset.book;
+                return rows.every(a=>a.bookId===id) && books.some(b=>b.id===id)}"""))
+
+        # an Ask AI thread is stored per passage and comes back
+        clear_idb()
+        page.reload()
+        page.wait_for_timeout(700)
+        drag(0.05, 0.5)
+        page.click('.bk-bar button[data-act="ask"]')
+        page.wait_for_timeout(400)
+        page.wait_for_function(
+            "()=>document.querySelector('#askpanel [data-act=\"stop\"]').disabled",
+            timeout=30000)
+        page.fill("#askpanel textarea", "and what about retries?")
+        page.keyboard.press("Enter")
+        page.wait_for_function(
+            "()=>document.querySelector('#askpanel [data-act=\"stop\"]').disabled",
+            timeout=30000)
+        check("the chat is written to IndexedDB",
+              page.evaluate("""async()=>{
+                const d=await new Promise(r=>{const q=indexedDB.open('bookify');
+                  q.onsuccess=()=>r(q.result);q.onerror=()=>r(null)});
+                if(!d)return 0;
+                const rows=await new Promise(r=>{const tx=d.transaction(['chats'],'readonly');
+                  const rq=tx.objectStore('chats').getAll();
+                  rq.onsuccess=()=>r(rq.result||[]);rq.onerror=()=>r([])});
+                d.close();
+                return rows.length===1 && rows[0].msgs.length===4}"""))
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(300)
+        page.reload()
+        page.wait_for_timeout(900)
+        drag(0.05, 0.5)
+        page.click('.bk-bar button[data-act="ask"]')
+        page.wait_for_timeout(900)
+        check("reopening the passage restores the thread",
+              page.evaluate("()=>document.querySelectorAll('#askpanel .ap-msg').length")== 4
+              and "restored" in page.evaluate("()=>document.querySelector('#askpanel .sp').textContent"))
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(300)
 
         # book map: dragging a node must not navigate
         page.goto(s.url + "/__map__.html")

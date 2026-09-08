@@ -782,22 +782,122 @@ const ROOT=document.body.dataset.root||'';
 // filesystem path under file:// and would carry any mount prefix when served
 // under a subpath; this way one key works everywhere, and ROOT+key is always a
 // link that resolves from the current page.
-const PAGE=(()=>{const d=ROOT.split('../').length-1;
+const PAGE=document.body.dataset.page||(()=>{const d=ROOT.split('../').length-1;
 const segs=decodeURIComponent(location.pathname).split('/').filter(Boolean);
 return segs.slice(Math.max(0,segs.length-(d+1))).join('/')||'index.html'})();
+const BOOK=document.body.dataset.book||'default';
+const BOOK_TITLE=document.body.dataset.bookTitle||document.title;
 let db={version:1,pages:{}},remote=false,live=[];
-async function load(){try{const r=await fetch('/__annotations__',{cache:'no-store'});
-if(r.ok){db=await r.json();db.pages=db.pages||{};remote=true;return}}catch(e){}
-try{db=JSON.parse(localStorage.getItem('bookify-ann')||'{"pages":{}}')}catch(e){db={pages:{}}}}
-// Post only the pages this action touched and adopt the merged result, so a
-// second tab annotating another page can't clobber this one's work.
+
+// ---- IndexedDB: the durable home for every book's annotations and chats.
+// The server's annotations.json stays as a mirror, because IndexedDB is scoped
+// to an origin *including the port* -- a book served on another port, or opened
+// off disk, is a different database. Merging the two on load means either side
+// can rebuild the other. ----
+const IDB={db:null,ok:false};
+const STORES={books:{keyPath:'id'},
+annotations:{keyPath:'id',indexes:{by_book:'bookId',by_page:['bookId','page']}},
+chats:{keyPath:'id',indexes:{by_book:'bookId',by_anchor:['bookId','anchor']}}};
+function idbOpen(){return new Promise(res=>{
+let req;try{req=indexedDB.open('bookify',1)}catch(e){return res(null)}
+req.onupgradeneeded=e=>{const d=e.target.result;
+for(const[name,spec]of Object.entries(STORES)){
+const st=d.objectStoreNames.contains(name)?req.transaction.objectStore(name)
+:d.createObjectStore(name,{keyPath:spec.keyPath});
+for(const[ix,keys]of Object.entries(spec.indexes||{}))
+if(!st.indexNames.contains(ix))st.createIndex(ix,keys)}};
+req.onsuccess=()=>res(req.result);
+req.onerror=()=>res(null);req.onblocked=()=>res(null)})}
+function idbDo(names,mode,fn){return new Promise((res,rej)=>{
+if(!IDB.db)return rej(new Error('no idb'));
+let tx;try{tx=IDB.db.transaction(names,mode)}catch(e){return rej(e)}
+let out;tx.oncomplete=()=>res(out);
+tx.onerror=tx.onabort=()=>rej(tx.error||new Error('idb aborted'));
+out=fn(tx)})}
+const idbReq=r=>new Promise((res,rej)=>{r.onsuccess=()=>res(r.result);
+r.onerror=()=>rej(r.error)});
+async function idbAll(store,index,key){try{return await idbDo([store],'readonly',tx=>{
+const st=tx.objectStore(store);const src=index?st.index(index):st;
+const r=src.getAll(key===undefined?undefined:key);const box={v:[]};
+r.onsuccess=()=>{box.v=r.result||[]};return box}).then(b=>b.v)}catch(e){return[]}}
+async function idbPut(store,recs){if(!recs.length)return;
+try{await idbDo([store],'readwrite',tx=>{const st=tx.objectStore(store);
+for(const rec of recs)st.put(rec)})}catch(e){}}
+
+// last write wins per annotation id; a tombstone beats a live record on a tie,
+// so a delete is never resurrected by whichever store is behind
+function newest(a,b){if(!a)return b;if(!b)return a;
+const ta=a.updated||a.ts||0,tb=b.updated||b.ts||0;
+if(ta!==tb)return ta>tb?a:b;
+return (a.deleted&&!b.deleted)?a:(b.deleted&&!a.deleted)?b:a}
+function mergeLists(...lists){const by=new Map();
+for(const l of lists)for(const r of l||[]){if(!r||!r.id)continue;
+by.set(r.id,newest(by.get(r.id),r))}
+return[...by.values()]}
+const alive=l=>(l||[]).filter(a=>a&&!a.deleted);
+const stamp=a=>{a.updated=Date.now();return a};
+
+// flat IndexedDB records <-> the {pages:{page:[...]}} shape the UI works with
+function recsToPages(recs){const pages={};
+for(const r of recs){const{bookId,page,...ann}=r;
+if(bookId&&bookId!==BOOK)continue;
+(pages[page]=pages[page]||[]).push({...ann,id:String(ann.id).replace(BOOK+':','')})}
+return pages}
+function pagesToRecs(pages){const out=[];
+for(const[page,list]of Object.entries(pages||{}))for(const a of list||[])
+out.push({...a,id:BOOK+':'+a.id,bookId:BOOK,page});
+return out}
+
+async function serverGet(){try{const r=await fetch('/__annotations__',{cache:'no-store'});
+if(r.ok){const j=await r.json();remote=true;return(j&&j.pages)||{}}}catch(e){}
+return null}
+async function serverPut(pages){if(!remote)return null;
+try{const r=await fetch('/__annotations__',{method:'POST',
+headers:{'Content-Type':'application/json'},body:JSON.stringify({merge:pages})});
+if(r.ok){const j=await r.json();return(j&&j.pages)||{}}}catch(e){}
+return null}
+
+async function load(){
+IDB.db=await idbOpen();IDB.ok=!!IDB.db;
+const localPages=IDB.ok?recsToPages(await idbAll('annotations','by_book',BOOK)):{};
+// one-time lift of anything saved before IndexedDB existed
+let legacy={};
+try{legacy=(JSON.parse(localStorage.getItem('bookify-ann')||'{}').pages)||{}}catch(e){}
+const serverPages=await serverGet();
+const pages={};
+for(const key of new Set([...Object.keys(localPages),...Object.keys(legacy),
+...Object.keys(serverPages||{})]))
+pages[key]=mergeLists(localPages[key],legacy[key],(serverPages||{})[key]);
+db={version:1,pages};
+if(IDB.ok){await idbPut('annotations',pagesToRecs(pages));await bookRow()}
+// push the merged view back so the mirror carries what only IndexedDB had
+const changed={};
+for(const[k,v]of Object.entries(pages)){
+const before=JSON.stringify((serverPages||{})[k]||[]);
+if(JSON.stringify(v)!==before)changed[k]=v}
+if(remote&&Object.keys(changed).length)await serverPut(changed);
+if(!remote&&!IDB.ok){try{localStorage.setItem('bookify-ann',
+JSON.stringify({version:1,pages}))}catch(e){}}}
+
+// Write the pages this action touched to every store that is available. Each
+// one is independently sufficient, so losing either does not lose the notes.
+// a row per book, so the library is enumerable and each book's data is scoped
+async function bookRow(){if(!IDB.ok)return;
+const notes=Object.values(db.pages).reduce((n,l)=>n+alive(l).length,0);
+await idbPut('books',[{id:BOOK,title:BOOK_TITLE,
+pages:Object.keys(db.pages).filter(k=>alive(db.pages[k]).length).length,
+notes,opened:Date.now()}])}
+
 async function save(pgs){const only=(pgs&&pgs.length)?pgs:[PAGE];
-if(remote){try{const r=await fetch('/__annotations__',{method:'POST',
-headers:{'Content-Type':'application/json'},
-body:JSON.stringify({merge:Object.fromEntries(only.map(k=>[k,db.pages[k]||[]]))})});
-if(r.ok){const j=await r.json();
-if(j&&j.pages){db=j;db.pages=db.pages||{}}return}}catch(e){}}
-try{localStorage.setItem('bookify-ann',JSON.stringify(db))}catch(e){}}
+const touched=Object.fromEntries(only.map(k=>[k,db.pages[k]||[]]));
+if(IDB.ok)await idbPut('annotations',pagesToRecs(touched));
+const merged=await serverPut(touched);
+if(merged){for(const k of only)db.pages[k]=mergeLists(db.pages[k],merged[k]);
+if(IDB.ok)await idbPut('annotations',
+pagesToRecs(Object.fromEntries(only.map(k=>[k,db.pages[k]||[]]))))}
+if(IDB.ok)await bookRow();
+if(!remote&&!IDB.ok){try{localStorage.setItem('bookify-ann',
+JSON.stringify(db))}catch(e){}}}
 
 // display only -- never store this, `exact` must stay verbatim to re-anchor
 const tidy=t=>String(t).replace(/\\s+/g,' ').trim();
@@ -816,7 +916,7 @@ const hlPlain=new Highlight(),hlNote=new Highlight();
 CSS.highlights.set('bk-hl',hlPlain);CSS.highlights.set('bk-note',hlNote);
 function paint(){hlPlain.clear();hlNote.clear();live=[];
 const ns=nodes(),txt=fullText(ns);
-for(const a of db.pages[PAGE]||[]){const off=nth(txt,a.exact,a.occ||0);
+for(const a of alive(db.pages[PAGE])){const off=nth(txt,a.exact,a.occ||0);
 if(off<0)continue;const r=makeRange(ns,off,off+a.exact.length);if(!r)continue;
 (a.note?hlNote:hlPlain).add(r);live.push({a,r})}}
 
@@ -835,13 +935,13 @@ if(!(e>s))return null;
 return{s,e,txt:fullText(nodes())}}
 // annotations the current selection overlaps -- powers the Unhighlight action
 function overlapping(o){const out=[];
-for(const a of db.pages[PAGE]||[]){const off=nth(o.txt,a.exact,a.occ||0);
+for(const a of alive(db.pages[PAGE])){const off=nth(o.txt,a.exact,a.occ||0);
 if(off<0)continue;if(off<o.e&&off+a.exact.length>o.s)out.push(a)}return out}
 function annFromSelection(sel){const o=selOffsets(sel);if(!o)return null;
 const exact=o.txt.slice(o.s,o.e);
 let occ=0,i=o.txt.indexOf(exact);while(i>=0&&i<o.s){occ++;i=o.txt.indexOf(exact,i+1)}
 return{id:Date.now().toString(36)+Math.random().toString(36).slice(2,6),
-exact,occ,note:'',ts:Date.now()}}
+exact,occ,note:'',ts:Date.now(),updated:Date.now()}}
 
 // selection toolbar
 const bar=document.createElement('div');bar.className='bk-bar';bar.hidden=true;
@@ -904,7 +1004,7 @@ bar.addEventListener('click',async e=>{const act=e.target.dataset.act;if(!act)re
 const sel=getSelection();if(sel.isCollapsed)return;hideBar();
 if(act==='unhl'){const o=selOffsets(sel);if(!o)return;
 const kill=new Set(overlapping(o).map(a=>a.id));if(!kill.size)return;
-db.pages[PAGE]=(db.pages[PAGE]||[]).filter(a=>!kill.has(a.id));
+for(const a of db.pages[PAGE]||[])if(kill.has(a.id)){a.deleted=true;stamp(a)}
 sel.removeAllRanges();await save();paint();panelRender();return}
 const ann=annFromSelection(sel);if(!ann)return;
 if(act==='ask'){const o=selOffsets(sel);
@@ -931,8 +1031,8 @@ const hit=live.find(({r})=>{try{return r.isPointInRange(node,off)}catch(err){ret
 if(!hit)return;e.preventDefault();hideBar();getSelection().removeAllRanges();
 const r=await edit(hit.a.exact,hit.a.note||'',true);if(!r)return;
 if(r.ask){askStart(hit.a.exact,hit.a);return}
-if(r.del)db.pages[PAGE]=(db.pages[PAGE]||[]).filter(x=>x.id!==hit.a.id);
-else hit.a.note=r.note;
+if(r.del){hit.a.deleted=true;stamp(hit.a)}
+else{hit.a.note=r.note;stamp(hit.a)}
 await save();paint();panelRender()});
 
 // ---- Ask AI: a chat sidebar about the highlighted passage. Multi-turn, so
@@ -948,6 +1048,7 @@ askPanel.innerHTML=
 '<div class="ap-chips"></div>'+
 '<div class="ap-foot"><textarea rows="2" placeholder="Ask about this passage, or push back\u2026"></textarea>'+
 '<div class="ap-row"><span class="sp"></span>'+
+'<button data-act="reset" title="Start this conversation over">New</button>'+
 '<button data-act="note">Save answer to notes</button>'+
 '<button data-act="stop">Stop</button>'+
 '<button data-act="send">Send</button></div></div>';
@@ -983,13 +1084,28 @@ function askContext(exact){const txt=fullText(nodes());
 const i=txt.indexOf(exact);if(i<0)return exact;
 return txt.slice(Math.max(0,i-700),Math.min(txt.length,i+exact.length+700))}
 
-function askStart(quote,ann){chat={quote,context:askContext(quote),msgs:[],ann:ann||null};
+// one chat per (book, page, passage); the id is stable so the thread comes back
+const chatId=quote=>BOOK+':'+PAGE+':'+String(quote).replace(/\\s+/g,' ').trim().slice(0,120);
+async function chatLoad(quote){if(!IDB.ok)return null;
+const rows=await idbAll('chats','by_anchor',[BOOK,chatId(quote)]);
+const row=rows.sort((a,b)=>(b.updated||0)-(a.updated||0))[0];
+return row&&Array.isArray(row.msgs)?row:null}
+async function chatSave(){if(!IDB.ok||!chat.quote)return;
+await idbPut('chats',[{id:chatId(chat.quote),bookId:BOOK,anchor:chatId(chat.quote),
+page:PAGE,quote:chat.quote,annId:chat.ann?chat.ann.id:null,
+msgs:chat.msgs.filter(m=>m.role!=='error').map(m=>({role:m.role,content:m.content})),
+updated:Date.now()}])}
+
+async function askStart(quote,ann){chat={quote,context:askContext(quote),msgs:[],ann:ann||null};
 apQuote.textContent=tidy(quote);apChips.innerHTML='';
 for(const t of PRESETS){const b=document.createElement('button');b.type='button';
 b.textContent=t;b.onclick=()=>askSend(t);apChips.appendChild(b)}
-apStatus.textContent='';apRender();askOpen(true);
+apStatus.textContent='';askOpen(true);
 apInput.value='';setTimeout(()=>apInput.focus(),120);
-askSend('Explain this passage.',true)}
+const prior=await chatLoad(quote);
+if(prior&&prior.msgs.length){chat.msgs=prior.msgs.map(m=>({...m}));
+apStatus.textContent='earlier conversation restored';apRender();return}
+apRender();askSend('Explain this passage.',true)}
 
 async function askSend(text,silent){const q=(text||'').trim();
 if(!q||inflight||!ASK.ok)return;
@@ -1019,19 +1135,23 @@ if(!slot.content.trim())throw new Error('no answer came back');}
 catch(err){const aborted=err&&err.name==='AbortError';
 if(!slot.content.trim())chat.msgs.splice(chat.msgs.indexOf(slot),1);
 if(!aborted)chat.msgs.push({role:'error',content:String(err&&err.message||err)});}
-finally{slot.streaming=false;inflight=null;apStatus.textContent='';apRender()}}
+finally{slot.streaming=false;inflight=null;apStatus.textContent='';apRender();
+// awaited, so a turn is on disk before the panel reports itself idle
+await chatSave()}}
 
 askPanel.addEventListener('click',async e=>{
 const act=e.target.dataset.act;if(!act)return;
 if(act==='close'){if(inflight)inflight.abort();askOpen(false);return}
 if(act==='stop'){if(inflight)inflight.abort();return}
+if(act==='reset'){if(inflight)inflight.abort();
+chat.msgs=[];await chatSave();apRender();askSend('Explain this passage.',true);return}
 if(act==='send'){askSend(apInput.value);return}
 if(act==='note'){const last=[...chat.msgs].reverse().find(m=>m.role==='ai'&&m.content.trim());
 if(!last)return;
-let a=chat.ann&&(db.pages[PAGE]||[]).find(x=>x.id===chat.ann.id);
+let a=chat.ann&&alive(db.pages[PAGE]).find(x=>x.id===chat.ann.id);
 if(!a){a=annFromText(chat.quote);if(!a){apStatus.textContent='could not anchor that passage';return}
 (db.pages[PAGE]=db.pages[PAGE]||[]).push(a);chat.ann=a}
-a.note=(a.note?a.note+'\\n\\n':'')+'AI: '+last.content.trim();
+a.note=(a.note?a.note+'\\n\\n':'')+'AI: '+last.content.trim();stamp(a);
 await save();paint();panelRender();apStatus.textContent='saved to notes'}});
 apInput.addEventListener('keydown',e=>{
 if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();askSend(apInput.value)}});
@@ -1042,7 +1162,7 @@ const p=ASK.providers.find(x=>x.id===ASK.id);ASK.label=p?p.label:'AI'});
 function annFromText(exact){const txt=fullText(nodes());
 if(txt.indexOf(exact)<0)return null;
 return{id:Date.now().toString(36)+Math.random().toString(36).slice(2,6),
-exact,occ:0,note:'',ts:Date.now()}}
+exact,occ:0,note:'',ts:Date.now(),updated:Date.now()}}
 
 (async()=>{try{const r=await fetch('/__ask__',{cache:'no-store'});
 if(!r.ok)return;const j=await r.json();
@@ -1067,7 +1187,7 @@ if(!document.body.classList.contains('notes-open'))return;
 if(e.target.closest('#notespanel')||e.target.closest('#notesbtn'))return;
 document.body.classList.remove('notes-open')});
 function panelRender(){const entries=Object.entries(db.pages)
-.map(([pg,list])=>[pg,list||[]]).filter(([,l])=>l.length);
+.map(([pg,list])=>[pg,alive(list)]).filter(([,l])=>l.length);
 const count=entries.reduce((n,[,l])=>n+l.length,0);
 if(btn)btn.textContent='Notes'+(count?' ('+count+')':'');
 let h='<div class="np-head"><h2>Annotations</h2>'+
@@ -1086,16 +1206,17 @@ h+='<div class="np-actions"><button data-act="export">Export Markdown</button></
 panel.innerHTML=h}
 panel.addEventListener('click',async e=>{
 if(e.target.dataset.act==='close'){document.body.classList.remove('notes-open');return}
-if(e.target.dataset.act==='export'){let md='# Annotations\\n';
-for(const[pg,list]of Object.entries(db.pages)){if(!(list||[]).length)continue;
-md+='\\n## '+pg+'\\n';for(const a of list){md+='\\n> '+a.exact.trim()+'\\n';
+if(e.target.dataset.act==='export'){let md='# '+BOOK_TITLE+' — annotations\\n';
+for(const[pg,list]of Object.entries(db.pages)){if(!alive(list).length)continue;
+md+='\\n## '+pg+'\\n';for(const a of alive(list)){md+='\\n> '+a.exact.trim()+'\\n';
 if(a.note)md+='\\n'+a.note+'\\n'}}
 const u=URL.createObjectURL(new Blob([md],{type:'text/markdown'}));
 const a=document.createElement('a');a.href=u;a.download='annotations.md';
 document.body.appendChild(a);a.click();a.remove();
 setTimeout(()=>URL.revokeObjectURL(u),1000);return}
 const d=e.target.dataset.del;if(!d)return;
-const[pg,id]=d.split('|');db.pages[pg]=(db.pages[pg]||[]).filter(x=>x.id!==id);
+const[pg,id]=d.split('|');
+for(const a of db.pages[pg]||[])if(a.id===id){a.deleted=true;stamp(a)}
 await save([pg]);paint();panelRender()});
 
 load().then(()=>{paint();panelRender()})})();
@@ -1155,7 +1276,8 @@ def _contains(tree: dict, page: Page) -> bool:
     return any(_contains(sub, page) for sub in tree["dirs"].values())
 
 
-def write_html_book(pages: list[Page], tree: dict, out: Path, title: str) -> None:
+def write_html_book(pages: list[Page], tree: dict, out: Path, title: str,
+                    book_id: str = "") -> None:
     light_hl = HtmlFormatter(style="default").get_style_defs(".highlight")
     dark_fmt = HtmlFormatter(style="github-dark")
     hl_css = (
@@ -1196,7 +1318,9 @@ def write_html_book(pages: list[Page], tree: dict, out: Path, title: str) -> Non
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>📖</text></svg>">
 <script>{THEME_INIT}</script>
 <link rel="stylesheet" href="{to_root}book.css"><script src="{to_root}book.js" defer></script>
-</head><body data-root="{to_root}"><div class="layout">
+</head><body data-root="{to_root}" data-book="{html_mod.escape(book_id)}"
+ data-book-title="{html_mod.escape(title)}"
+ data-page="{html_mod.escape(str(page.out_rel_html).replace(chr(92), "/"))}"><div class="layout">
 <nav class="sidebar">
 <div class="side-head"><a class="brand" href="{to_root}index.html">{html_mod.escape(title)}</a>
 <button id="themetoggle" type="button" title="Cycle theme: auto / light / dark">&#9680;</button></div>
@@ -1482,6 +1606,8 @@ def ai_overview(pages: list[Page], out: Path, title: str, model: str) -> "Page |
 # token); otherwise we shell out to an installed assistant CLI.
 
 ASK_TIMEOUT = 240
+# how long a deletion is remembered so it can propagate to every store
+TOMBSTONE_TTL = 60 * 60 * 24 * 30
 
 # id -> (label, argv builder, streams?).  argv builders take the flattened
 # prompt and a path for the provider to write its final message to.
@@ -1729,13 +1855,16 @@ def main() -> int:
     ASK_TIMEOUT = max(10, args.ask_timeout)
 
     root = Path(args.folder).expanduser().resolve()
+    # identifies this book in the browser's IndexedDB. Derived from the source
+    # path so it survives rebuilds, a different --serve port and a new --title.
+    book_id = hashlib.sha1(str(root).encode()).hexdigest()[:16]
     if not root.is_dir():
         print(f"bookify: not a directory: {root}", file=sys.stderr)
         return 1
     if args.out:
         out = Path(args.out).expanduser().resolve()
     else:
-        tag = hashlib.sha1(str(root).encode()).hexdigest()[:8]
+        tag = book_id[:8]
         out = Path.home() / ".cache" / "bookify" / f"{root.name}-{tag}"
     title = args.title or root.name
 
@@ -1776,7 +1905,7 @@ def main() -> int:
     tree = build_tree(pages)
     dests = []
     if args.format in ("html", "both"):
-        write_html_book(pages, tree, out / "html", title)
+        write_html_book(pages, tree, out / "html", title, book_id)
         write_map_page(pages, out / "html", title)
         dests.append(out / "html")
         print(f"HTML book:     {out / 'html' / 'index.html'}")
@@ -1820,6 +1949,26 @@ def main() -> int:
                 ask_state["at"] = now
             return ask_state["providers"]
 
+        def prune_tombstones(items):
+            """Keep deletions long enough to reach every store, then forget them.
+
+            A delete has to be recorded, not just omitted: the browser's
+            IndexedDB copy and this file sync both ways, and a missing record
+            is indistinguishable from one the other side has not seen yet, so
+            dropping it outright would let a deleted note come back.
+            """
+            if not isinstance(items, list):
+                return []
+            cutoff = (time.time() - TOMBSTONE_TTL) * 1000
+            out = []
+            for a in items:
+                if not isinstance(a, dict) or not a.get("id"):
+                    continue
+                if a.get("deleted") and (a.get("updated") or a.get("ts") or 0) < cutoff:
+                    continue
+                out.append(a)
+            return out
+
         def read_annotations() -> dict:
             try:
                 db = jsonlib.loads(ann_path.read_bytes())
@@ -1842,12 +1991,16 @@ def main() -> int:
                 if isinstance(payload.get("merge"), dict):
                     db = read_annotations()
                     for page, items in payload["merge"].items():
+                        items = prune_tombstones(items)
                         if items:
                             db["pages"][str(page)] = items
                         else:
                             db["pages"].pop(str(page), None)
                 elif isinstance(payload.get("pages"), dict):
-                    db = {"version": 1, "pages": payload["pages"]}
+                    db = {"version": 1, "pages": {
+                        k: prune_tombstones(v)
+                        for k, v in payload["pages"].items()}}
+                    db["pages"] = {k: v for k, v in db["pages"].items() if v}
                 else:
                     raise ValueError("expected 'merge' or 'pages'")
                 tmp = ann_path.with_suffix(".json.tmp")
