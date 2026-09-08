@@ -1,0 +1,2062 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#   "markdown>=3.5",
+#   "pygments>=2.17",
+# ]
+# ///
+"""
+bookify — render any folder's docs as a browsable book (HTML + Markdown).
+
+Walks a directory tree, collects documentation files (Markdown, txt, rst,
+adoc — and optionally source code), and generates:
+
+  <out>/html/      a static HTML book with a sidebar navigation tree,
+                   per-page prev/next links, and syntax highlighting
+  <out>/markdown/  a Markdown book: SUMMARY.md (table of contents),
+                   normalized per-file pages, and BOOK.md (single combined file)
+
+Output goes to ~/.cache/bookify/<name>-<pathhash>/ by default, NOT into the
+scanned folder, so rendered artifacts never pollute a repo. Every output dir
+also gets a `.gitignore` containing `*` as a safety net for custom -o paths.
+
+Usage:
+  bookify <folder> [-o OUT] [--format html|md|both] [--title TITLE]
+                   [--include-code] [--serve [PORT]] [--no-serve]
+
+By default bookify builds and then serves the HTML book locally (opening the
+browser). Pass --no-serve for a build-only run (e.g. from scripts or agents).
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import html as html_mod
+import os
+import posixpath
+import re
+import shutil
+import sys
+from urllib.parse import unquote
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import markdown as md_lib
+from pygments.formatters import HtmlFormatter
+
+# ----------------------------------------------------------------------------
+# File classification
+
+DOC_EXTS = {".md", ".markdown", ".mdown", ".mkd", ".txt", ".rst", ".adoc", ".asciidoc"}
+CODE_EXTS = {
+    ".py": "python", ".js": "javascript", ".ts": "typescript", ".tsx": "tsx",
+    ".jsx": "jsx", ".rs": "rust", ".go": "go", ".java": "java", ".rb": "ruby",
+    ".sh": "bash", ".zsh": "bash", ".c": "c", ".h": "c", ".cpp": "cpp",
+    ".hpp": "cpp", ".cs": "csharp", ".swift": "swift", ".kt": "kotlin",
+    ".yaml": "yaml", ".yml": "yaml", ".json": "json", ".toml": "toml",
+    ".ini": "ini", ".cfg": "ini", ".sql": "sql",
+    ".css": "css", ".xml": "xml", ".proto": "protobuf", ".graphql": "graphql",
+    ".dockerfile": "dockerfile", ".tf": "terraform", ".lua": "lua", ".r": "r",
+}
+SKIP_DIRS = {
+    ".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv",
+    "env", ".tox", ".mypy_cache", ".pytest_cache", ".ruff_cache", "dist",
+    "build", "target", ".next", ".nuxt", ".cache", "coverage", ".idea",
+    ".vscode", "vendor", ".terraform", ".DS_Store", ".bookify",
+}
+MD_EXTS = {".md", ".markdown", ".mdown", ".mkd"}
+HTML_EXTS = {".html", ".htm", ".xhtml"}
+# files a doc can point at and expect to still be there in the output
+ASSET_EXTS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".avif", ".ico", ".bmp",
+    ".pdf", ".mp4", ".webm", ".mov", ".m4v", ".mp3", ".wav", ".ogg",
+    ".woff", ".woff2", ".ttf", ".otf", ".csv", ".tsv", ".zip",
+}
+MAX_ASSET_BYTES = 25 * 1024 * 1024
+
+MD_RENDERER = md_lib.Markdown(
+    extensions=["extra", "toc", "sane_lists", "codehilite", "admonition"],
+    extension_configs={"codehilite": {"guess_lang": False, "css_class": "highlight"}},
+)
+
+
+@dataclass
+class Page:
+    src: Path            # absolute source path
+    rel: Path            # path relative to the root folder
+    title: str = ""
+    kind: str = "md"     # md | text | code
+    lang: str = ""       # pygments hint for code files
+    html_body: str = ""
+    md_body: str = ""
+    # prev/next are cyclic and link_* are derived: comparing them would make
+    # Page.__eq__ recurse through the whole book
+    prev: "Page | None" = field(default=None, repr=False, compare=False)
+    next: "Page | None" = field(default=None, repr=False, compare=False)
+    _out_html: "Path | None" = field(default=None, repr=False, compare=False)
+    _out_md: "Path | None" = field(default=None, repr=False, compare=False)
+
+    @property
+    def out_rel_html(self) -> Path:
+        if self._out_html:
+            return self._out_html
+        return self.default_out_html
+
+    @property
+    def default_out_html(self) -> Path:
+        if self.kind == "html":
+            return self.rel  # keep the original path so existing .html links still work
+        if self.kind == "code":
+            return self.rel.with_suffix(self.rel.suffix + ".html")
+        return self.rel.with_suffix(".html")
+
+    @property
+    def out_rel_md(self) -> Path:
+        if self._out_md:
+            return self._out_md
+        return self.default_out_md
+
+    @property
+    def default_out_md(self) -> Path:
+        if self.kind == "md":
+            return self.rel.with_suffix(".md")
+        return self.rel.with_suffix(self.rel.suffix + ".md")
+
+
+def first_heading(text: str) -> str | None:
+    for line in text.splitlines():
+        m = re.match(r"^#{1,6}\s+(.*)", line)
+        if m:
+            return re.sub(r"[#*`_\[\]]", "", m.group(1)).strip()
+    return None
+
+
+def html_title(text: str) -> str | None:
+    m = re.search(r"<title[^>]*>(.*?)</title>", text, re.I | re.S) or \
+        re.search(r"<h1[^>]*>(.*?)</h1>", text, re.I | re.S)
+    if m:
+        t = html_mod.unescape(re.sub(r"<[^>]+>", "", m.group(1))).strip()
+        return t or None
+    return None
+
+
+def humanize(name: str) -> str:
+    stem = Path(name).stem
+    return re.sub(r"[-_]+", " ", stem).strip().title() or name
+
+
+def sort_key(p: Path) -> tuple:
+    """README/index first, then case-insensitive alphabetical."""
+    stem = p.stem.lower()
+    return (0 if stem in ("readme", "index", "home") else 1, str(p).lower())
+
+
+def collect_pages(root: Path, include_code: bool) -> list[Page]:
+    pages: list[Page] = []
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        if any(part in SKIP_DIRS or part.startswith(".") for part in path.relative_to(root).parts[:-1]):
+            continue
+        name = path.name
+        if name.startswith(".") and name.lower() != ".env.example":
+            continue
+        ext = path.suffix.lower()
+        kind = lang = None
+        if ext in DOC_EXTS:
+            kind = "md" if ext in MD_EXTS else "text"
+        elif ext in HTML_EXTS:
+            kind = "html"
+        elif name.lower() in ("dockerfile", "makefile", "justfile"):
+            if include_code:
+                kind, lang = "code", {"dockerfile": "dockerfile", "makefile": "makefile", "justfile": "makefile"}[name.lower()]
+        elif ext in CODE_EXTS:
+            if include_code:
+                kind, lang = "code", CODE_EXTS[ext]
+        if kind is None:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        rel = path.relative_to(root)
+        if kind == "md":
+            title = first_heading(text) or humanize(name)
+        elif kind == "html":
+            title = html_title(text) or humanize(name)
+        elif kind == "code":
+            title = name  # keep exact filename for code pages
+        else:
+            title = humanize(name)
+        pages.append(Page(src=path, rel=rel, title=title, kind=kind, lang=lang or ""))
+
+    pages.sort(key=lambda p: (tuple(str(x).lower() for x in p.rel.parts[:-1]), sort_key(p.rel)))
+    assign_out_paths(pages)
+    for a, b in zip(pages, pages[1:]):
+        a.next, b.prev = b, a
+    return pages
+
+
+def assign_out_paths(pages: list[Page]) -> None:
+    """Give every page a unique output path in each book.
+
+    Without this, sibling sources that differ only by extension (the common
+    `README.md` + `README.rst` pair, say) both want `README.html` and one
+    silently overwrites the other. HTML sources keep their exact path so
+    hand-written .html links keep resolving; everyone else yields to them and
+    then to whoever claimed the name first (page order is stable, so README.md
+    keeps README.html and the .rst becomes README.rst.html).
+    """
+    for attr, default_attr, suffix in (("_out_html", "default_out_html", ".html"),
+                                       ("_out_md", "default_out_md", ".md")):
+        taken: set[Path] = {p.default_out_html for p in pages if p.kind == "html"} \
+            if attr == "_out_html" else set()
+        for p in pages:
+            if attr == "_out_html" and p.kind == "html":
+                continue
+            cand = getattr(p, default_attr)
+            if cand in taken:
+                # disambiguate by keeping the source extension: foo.rst -> foo.rst.html
+                cand = p.rel.with_suffix(p.rel.suffix + suffix)
+            base, n = cand, 2
+            while cand in taken:
+                cand = base.with_name(f"{base.stem}-{n}{base.suffix}")
+                n += 1
+            taken.add(cand)
+            setattr(p, attr, cand)
+
+
+# ----------------------------------------------------------------------------
+# Rendering
+
+def build_link_maps(pages: list[Page]) -> tuple[dict[str, str], dict[str, str]]:
+    """source path (posix, root-relative) -> output path, for each book."""
+    html_map = {p.rel.as_posix(): p.out_rel_html.as_posix() for p in pages}
+    md_map = {p.rel.as_posix(): p.out_rel_md.as_posix() for p in pages}
+    return html_map, md_map
+
+
+SKIP_HREF = ("http://", "https://", "mailto:", "tel:", "#", "/", "data:", "javascript:")
+
+
+def _retarget(href: str, page_dir: str, out_dir: str, link_map: dict[str, str],
+              fallback) -> str | None:
+    """Map one relative href onto the target page's real output path.
+
+    Returns the rewritten href, or None to leave the original untouched.
+    Resolving through link_map (rather than swapping the suffix blindly) is what
+    keeps links correct when a target had to be renamed to avoid a collision.
+    """
+    base, _, frag = href.partition("#")
+    if not base:
+        return None
+    # Try the map for any relative href, whatever its extension: with
+    # --include-code a link to scripts/foo.py has a rendered page too, and only
+    # real pages are ever in the map. Extension-based guessing is the fallback.
+    key = posixpath.normpath(posixpath.join(page_dir, base))
+    out = link_map.get(key)
+    if out is None:
+        ext = Path(base).suffix.lower()
+        if ext not in DOC_EXTS and ext not in HTML_EXTS:
+            return None
+        out = fallback(key)
+        if out is None:
+            return None
+    rel = posixpath.relpath(out, out_dir or ".")
+    return rel + ("#" + frag if frag else "")
+
+
+def rewrite_md_links(html: str, page: Page, link_map: dict[str, str]) -> str:
+    """Point relative links at the rendered HTML page for that source file."""
+    page_dir = page.rel.parent.as_posix()
+    page_dir = "" if page_dir == "." else page_dir
+    out_dir = posixpath.dirname(page.out_rel_html.as_posix())
+
+    def fallback(key: str) -> str | None:
+        # target isn't a collected page (percent-encoded name, or outside the
+        # tree): keep the old behaviour so nothing that used to work breaks
+        ext = Path(key).suffix.lower()
+        if ext in DOC_EXTS:
+            return posixpath.splitext(key)[0] + ".html"
+        return None
+
+    def repl(m: re.Match) -> str:
+        href = m.group(2)
+        if href.startswith(SKIP_HREF):
+            return m.group(0)
+        new = _retarget(href, page_dir, out_dir, link_map, fallback)
+        return m.group(0) if new is None else f"{m.group(1)}{new}{m.group(3)}"
+
+    return re.sub(r'(href=")([^"]+)(")', repl, html)
+
+
+def collect_assets(pages: list[Page], root: Path) -> dict[str, Path]:
+    """Local files the rendered pages point at (images, diagrams, PDFs, fonts).
+
+    Returns {root-relative posix path: source file}. Without copying these, a
+    doc that embeds a diagram renders a broken image, since only doc/code files
+    are ever collected as pages.
+    """
+    found: dict[str, Path] = {}
+    ref = re.compile(r'(?:src|href)="([^"]+)"')
+    root_resolved = root.resolve()
+    for page in pages:
+        page_dir = page.rel.parent.as_posix()
+        page_dir = "" if page_dir == "." else page_dir
+        for m in ref.finditer(page.html_body):
+            href = m.group(1)
+            if href.startswith(SKIP_HREF):
+                continue
+            base = href.partition("#")[0].partition("?")[0]
+            if not base or Path(base).suffix.lower() not in ASSET_EXTS:
+                continue
+            key = posixpath.normpath(posixpath.join(page_dir, unquote(base)))
+            if key.startswith("..") or key in found:
+                continue
+            src = root / key
+            try:
+                if not src.is_file() or src.stat().st_size > MAX_ASSET_BYTES:
+                    continue
+                # don't follow a link out of the tree we were asked to render
+                if root_resolved not in src.resolve().parents:
+                    continue
+            except OSError:
+                continue
+            found[key] = src
+    return found
+
+
+def copy_assets(assets: dict[str, Path], *dests: Path) -> int:
+    n = 0
+    for key, src in assets.items():
+        for dest_root in dests:
+            dest = dest_root / key
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.copyfile(src, dest)
+            except OSError:
+                continue
+        n += 1
+    return n
+
+
+def extract_html_body(text: str) -> str:
+    """Pull the displayable content out of a full HTML document."""
+    m = re.search(r"<body[^>]*>(.*)</body>", text, re.I | re.S)
+    body = m.group(1) if m else re.sub(
+        r"<!doctype[^>]*>|</?html[^>]*>|<head[^>]*>.*?</head>", "", text,
+        flags=re.I | re.S)
+    # scripts and document-level styles would fight the book's own layout
+    body = re.sub(r"<script[^>]*>.*?</script>", "", body, flags=re.I | re.S)
+    body = re.sub(r"<style[^>]*>.*?</style>", "", body, flags=re.I | re.S)
+    return body.strip()
+
+
+def rewrite_links_for_md_book(text: str, page: Page, md_map: dict[str, str]) -> str:
+    """In the Markdown book, pages can be renamed (<name>.<ext>.md, or -2 to
+    break a collision) — point relative links at the real output name."""
+    page_dir = page.rel.parent.as_posix()
+    page_dir = "" if page_dir == "." else page_dir
+    out_dir = posixpath.dirname(page.out_rel_md.as_posix())
+
+    def fallback(key: str) -> str | None:
+        ext = Path(key).suffix.lower()
+        return key if ext in MD_EXTS else key + ".md"
+
+    def fix(href: str) -> str:
+        if href.startswith(SKIP_HREF):
+            return href
+        new = _retarget(href, page_dir, out_dir, md_map, fallback)
+        return href if new is None else new
+
+    text = re.sub(r"(\]\()([^)\s]+)(\))", lambda m: m.group(1) + fix(m.group(2)) + m.group(3), text)
+    return re.sub(r'(href=")([^"]+)(")', lambda m: m.group(1) + fix(m.group(2)) + m.group(3), text)
+
+
+def render_page(page: Page, html_map: dict[str, str], md_map: dict[str, str]) -> None:
+    text = page.src.read_text(encoding="utf-8", errors="replace")
+    if page.kind == "md":
+        MD_RENDERER.reset()
+        page.html_body = rewrite_md_links(MD_RENDERER.convert(text), page, html_map)
+        page.md_body = rewrite_links_for_md_book(text, page, md_map)
+    elif page.kind == "html":
+        body = extract_html_body(text)
+        page.html_body = rewrite_md_links(body, page, html_map)
+        # markdown renders inline HTML, so the body carries over as-is
+        page.md_body = rewrite_links_for_md_book(body, page, md_map)
+    elif page.kind == "text":
+        page.html_body = f"<pre class='plaintext'>{html_mod.escape(text)}</pre>"
+        page.md_body = f"```\n{text}\n```" if page.src.suffix.lower() != ".md" else text
+    else:  # code
+        fenced = f"```{page.lang}\n{text}\n```"
+        MD_RENDERER.reset()
+        page.html_body = MD_RENDERER.convert(fenced)
+        page.md_body = fenced
+
+
+# ----------------------------------------------------------------------------
+# HTML book
+
+LIGHT_TOKENS = """--paper:#FBFAF7;--ink:#22262C;--muted:#666C75;--accent:#2E6E4E;
+--link:#245840;--panel:#F4F3EE;--border:#E3E1D8;--code-bg:#F1F0EA;
+--tint:rgba(46,110,78,.10);--shadow:rgba(30,32,28,.14);
+--hl:rgba(255,213,79,.45);--hl-note:rgba(46,110,78,.22)"""
+
+DARK_TOKENS = """--paper:#15171C;--ink:#DCDEE3;--muted:#8B919B;--accent:#7CC7A1;
+--link:#8ECFAC;--panel:#1B1E24;--border:#2A2E36;--code-bg:#1E222A;
+--tint:rgba(124,199,161,.10);--shadow:rgba(0,0,0,.5);
+--hl:rgba(255,213,79,.26);--hl-note:rgba(124,199,161,.24)"""
+
+CSS = f"""
+:root{{{LIGHT_TOKENS};
+--sidebar-w:300px;--outline-w:210px;
+--sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+--serif:Charter,"Bitstream Charter","Sitka Text",Cambria,Georgia,serif;
+--mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace}}
+@media(prefers-color-scheme:dark){{:root{{{DARK_TOKENS}}}}}
+:root[data-theme="dark"]{{{DARK_TOKENS}}}
+:root[data-theme="light"]{{{LIGHT_TOKENS}}}
+
+*{{box-sizing:border-box}}
+body{{margin:0;background:var(--paper);color:var(--ink);font:15px/1.6 var(--sans);
+-webkit-font-smoothing:antialiased}}
+a{{color:var(--link);text-decoration:none}}
+a:hover{{text-decoration:underline;text-underline-offset:3px}}
+:focus-visible{{outline:2px solid var(--accent);outline-offset:2px;border-radius:2px}}
+@media(prefers-reduced-motion:reduce){{*,*::before,*::after{{transition:none!important;
+animation:none!important}}}}
+
+.layout{{display:flex;min-height:100vh}}
+
+/* ---- sidebar ---- */
+nav.sidebar{{width:var(--sidebar-w);flex-shrink:0;background:var(--panel);
+border-right:1px solid var(--border);position:sticky;top:0;height:100vh;
+display:flex;flex-direction:column;padding:1.1rem 1rem 1rem}}
+.side-head{{display:flex;align-items:center;justify-content:space-between;gap:.5rem;
+margin-bottom:.9rem}}
+.brand{{font-family:var(--serif);font-size:1.12rem;font-weight:700;color:var(--ink);
+overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+.brand:hover{{text-decoration:none;color:var(--accent)}}
+#themetoggle{{border:1px solid var(--border);background:var(--paper);color:var(--muted);
+font:.72rem/1 var(--sans);padding:.35rem .6rem;border-radius:999px;cursor:pointer;
+letter-spacing:.04em;white-space:nowrap;flex-shrink:0}}
+#themetoggle:hover{{color:var(--ink);border-color:var(--muted)}}
+#navfilter{{width:100%;padding:.45rem .7rem;margin-bottom:.9rem;border:1px solid var(--border);
+border-radius:7px;background:var(--paper);color:var(--ink);font:.84rem var(--sans)}}
+#navfilter::placeholder{{color:var(--muted)}}
+.tree{{overflow-y:auto;flex:1;margin:0 -.4rem;padding:0 .4rem .5rem}}
+.tree ul{{list-style:none;margin:0;padding:0}}
+.tree li a{{display:block;padding:.3rem .6rem;border-radius:6px;color:var(--muted);
+font-size:.86rem;line-height:1.4;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+border-left:2px solid transparent}}
+.tree li a:hover{{color:var(--ink);background:var(--tint);text-decoration:none}}
+.tree li a.active{{color:var(--accent);background:var(--tint);font-weight:600;
+border-left-color:var(--accent);border-radius:0 6px 6px 0}}
+.tree details{{margin:.1rem 0}}
+.tree details ul{{margin-left:.55rem;padding-left:.55rem;border-left:1px solid var(--border)}}
+.tree summary{{cursor:pointer;color:var(--ink);font-weight:600;font-size:.86rem;
+padding:.3rem .6rem;border-radius:6px;list-style:none;display:flex;align-items:center;
+gap:.5rem;user-select:none}}
+.tree summary::-webkit-details-marker{{display:none}}
+.tree summary::before{{content:"";width:.4em;height:.4em;flex-shrink:0;
+border-right:1.5px solid var(--muted);border-bottom:1.5px solid var(--muted);
+transform:rotate(-45deg);transition:transform .15s}}
+.tree details[open]>summary::before{{transform:rotate(45deg)}}
+.tree summary:hover{{background:var(--tint)}}
+
+/* ---- content column ---- */
+.content{{flex:1;min-width:0}}
+.topbar{{display:flex;align-items:center;gap:.8rem;padding:.85rem 2.2rem;
+border-bottom:1px solid var(--border);position:sticky;top:0;z-index:10;
+background:color-mix(in srgb,var(--paper) 92%,transparent);backdrop-filter:blur(6px)}}
+#menubtn{{display:none}}
+.crumbs{{font-size:.76rem;color:var(--muted);letter-spacing:.06em;text-transform:uppercase;
+overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+.crumbs .sep{{margin:0 .5em;opacity:.45}}
+.page-grid{{display:grid;grid-template-columns:minmax(0,1fr) var(--outline-w);
+gap:3rem;max-width:76rem;margin:0 auto;padding:0 2.2rem}}
+main{{font-family:var(--serif);font-size:1.0625rem;line-height:1.72;
+max-width:44rem;width:100%;margin:0 auto;padding:2.2rem 0 3rem;min-width:0}}
+main h1,main h2,main h3,main h4{{font-family:var(--serif);line-height:1.25;
+text-wrap:balance;font-weight:700;color:var(--ink)}}
+main h1{{font-size:1.95rem;margin:0 0 1.1rem;letter-spacing:-.01em;
+padding-bottom:.6rem;border-bottom:1px solid var(--border)}}
+main h2{{font-size:1.42rem;margin:2.2rem 0 .7rem}}
+main h3{{font-size:1.15rem;margin:1.7rem 0 .5rem}}
+main p{{margin:.9rem 0}}
+main img{{max-width:100%;border-radius:6px}}
+main ul,main ol{{padding-left:1.4rem}}
+main li{{margin:.3rem 0}}
+main hr{{border:0;border-top:1px solid var(--border);margin:2rem 0}}
+main blockquote{{margin:1.2rem 0;padding:.15rem 0 .15rem 1.1rem;
+border-left:3px solid var(--accent);color:var(--muted);font-style:italic}}
+main table{{border-collapse:collapse;font-family:var(--sans);font-size:.9rem;
+display:block;overflow-x:auto;max-width:100%;font-variant-numeric:tabular-nums;
+margin:1.1rem 0}}
+main th,main td{{border:1px solid var(--border);padding:.5rem .85rem;text-align:left}}
+main th{{background:var(--panel);font-weight:600}}
+main code{{font-family:var(--mono);font-size:.82em;background:var(--code-bg);
+padding:.14em .38em;border-radius:4px}}
+main pre{{font-family:var(--mono);font-size:.83rem;line-height:1.55;
+background:var(--code-bg);border:1px solid var(--border);border-radius:8px;
+padding:1rem 1.1rem;overflow-x:auto;margin:1.1rem 0}}
+main pre code{{background:none;padding:0;font-size:1em}}
+.plaintext{{white-space:pre-wrap}}
+.codewrap{{position:relative;margin:1.1rem 0}}
+.codewrap pre{{margin:0}}
+.copy{{position:absolute;top:.55rem;right:.55rem;font:.72rem var(--sans);
+color:var(--muted);background:var(--paper);border:1px solid var(--border);
+border-radius:6px;padding:.25rem .6rem;cursor:pointer;opacity:0;transition:opacity .15s}}
+/* the label lives in CSS, not in a text node: anything inside <main> counts as
+   book text for annotation offsets, and "Copy"/"Copied" would shift them */
+.copy::after{{content:"Copy"}}
+.copy.done::after{{content:"Copied"}}
+.codewrap:hover .copy,.copy:focus-visible{{opacity:1}}
+.copy:hover{{color:var(--ink)}}
+/* no hover on touch: don't hide the only way to copy a block */
+@media(hover:none){{.copy{{opacity:1}}}}
+
+/* ---- pager ---- */
+.pager{{display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin-top:3.2rem;
+padding-top:1.4rem;border-top:1px solid var(--border);font-family:var(--sans)}}
+.pager-card{{display:flex;flex-direction:column;gap:.25rem;padding:.85rem 1.1rem;
+border:1px solid var(--border);border-radius:9px;min-width:0}}
+.pager-card.prev{{grid-column:1}}
+.pager-card.next{{grid-column:2;text-align:right}}
+.pager-card:hover{{text-decoration:none;border-color:var(--accent);background:var(--tint)}}
+.pager-eyebrow{{font-size:.7rem;letter-spacing:.07em;text-transform:uppercase;
+color:var(--muted)}}
+.pager-title{{font-weight:600;color:var(--ink);overflow:hidden;text-overflow:ellipsis;
+white-space:nowrap}}
+.pager-card:hover .pager-title{{color:var(--accent)}}
+
+/* ---- on-this-page outline ---- */
+.outline{{font-family:var(--sans);padding:2.4rem 0;position:sticky;top:3rem;
+align-self:start;max-height:calc(100vh - 3rem);overflow-y:auto}}
+.outline-head{{font-size:.7rem;font-weight:600;letter-spacing:.09em;
+text-transform:uppercase;color:var(--muted);margin-bottom:.6rem}}
+#outline{{list-style:none;margin:0;padding:0;border-left:1px solid var(--border)}}
+#outline li a{{display:block;padding:.22rem .8rem;color:var(--muted);font-size:.8rem;
+line-height:1.45;border-left:2px solid transparent;margin-left:-1px}}
+#outline li.h3 a{{padding-left:1.7rem}}
+#outline li a:hover{{color:var(--ink);text-decoration:none}}
+#outline li a.active{{color:var(--accent);border-left-color:var(--accent);font-weight:600}}
+
+/* ---- annotations ---- */
+::highlight(bk-hl){{background-color:var(--hl)}}
+::highlight(bk-note){{background-color:var(--hl-note);
+text-decoration:underline dotted var(--accent)}}
+.bk-bar{{position:absolute;z-index:60;display:flex;gap:.3rem;padding:.3rem;
+background:var(--panel);border:1px solid var(--border);border-radius:8px;
+box-shadow:0 4px 18px var(--shadow);font-family:var(--sans)}}
+/* author `display` above beats the UA [hidden] rule, so restate it explicitly --
+   otherwise the toolbar never goes away and covers (and swallows clicks on) text */
+.bk-bar[hidden],.bk-pop[hidden],.bk-back[hidden]{{display:none!important}}
+.bk-bar button,.bk-pop button{{font:.78rem var(--sans);color:var(--ink);
+background:var(--paper);border:1px solid var(--border);border-radius:6px;
+padding:.3rem .65rem;cursor:pointer}}
+.bk-bar button:hover,.bk-pop button:hover{{border-color:var(--accent);color:var(--accent)}}
+.bk-bar .danger:hover{{border-color:#B4544A;color:#B4544A}}
+.bk-back{{position:fixed;inset:0;z-index:65;background:rgba(20,18,14,.32)}}
+.bk-pop{{position:fixed;z-index:70;top:50%;left:50%;transform:translate(-50%,-50%);
+width:min(420px,90vw);background:var(--panel);border:1px solid var(--border);
+border-radius:10px;box-shadow:0 10px 40px var(--shadow);padding:1rem;
+font-family:var(--sans)}}
+.bk-pop .head{{display:flex;align-items:center;justify-content:space-between;
+gap:.6rem;margin:-.2rem 0 .6rem}}
+.bk-pop .head h3{{font:600 .85rem var(--sans);margin:0;color:var(--ink)}}
+.bk-pop .x{{font:1rem/1 var(--sans);color:var(--muted);background:none;
+border:1px solid transparent;border-radius:6px;padding:.2rem .45rem;cursor:pointer}}
+.bk-pop .x:hover{{color:var(--ink);border-color:var(--border)}}
+.bk-pop blockquote{{margin:0 0 .7rem;padding:.3rem .7rem;font-size:.82rem;
+color:var(--muted);border-left:3px solid var(--accent);max-height:5.5em;overflow:hidden}}
+.bk-pop textarea{{width:100%;min-height:5em;resize:vertical;font:.85rem var(--sans);
+color:var(--ink);background:var(--paper);border:1px solid var(--border);
+border-radius:7px;padding:.5rem .6rem;margin-bottom:.7rem}}
+.bk-pop .row{{display:flex;gap:.5rem;justify-content:flex-end;align-items:center}}
+.bk-pop .row button{{white-space:nowrap}}
+.bk-pop .hint{{font-size:.72rem;color:var(--muted);margin:0 auto 0 0;align-self:center;
+white-space:nowrap}}
+.bk-pop .danger:hover{{border-color:#B4544A;color:#B4544A}}
+#notesbtn{{margin-left:auto;font:.74rem var(--sans);color:var(--muted);
+background:none;border:1px solid var(--border);border-radius:999px;
+padding:.3rem .7rem;cursor:pointer;flex-shrink:0}}
+#notesbtn:hover{{color:var(--ink);border-color:var(--muted)}}
+#notespanel{{position:fixed;top:0;right:0;bottom:0;width:min(360px,92vw);z-index:50;
+background:var(--panel);border-left:1px solid var(--border);
+box-shadow:0 0 30px var(--shadow);padding:1.1rem;overflow-y:auto;
+font-family:var(--sans);transform:translateX(100%);transition:transform .2s;
+visibility:hidden}}
+body.notes-open #notespanel{{transform:none;visibility:visible}}
+#notespanel .np-head{{display:flex;align-items:center;justify-content:space-between;
+margin-bottom:.9rem}}
+#notespanel h2{{font:600 .95rem var(--sans);margin:0}}
+#notespanel .np-x{{font:1rem/1 var(--sans);color:var(--muted);background:none;
+border:1px solid var(--border);border-radius:6px;padding:.25rem .5rem;cursor:pointer}}
+#notespanel .np-x:hover{{color:var(--ink);border-color:var(--muted)}}
+#notespanel .np-page{{font-size:.7rem;font-weight:600;letter-spacing:.07em;
+text-transform:uppercase;color:var(--muted);margin:1rem 0 .3rem}}
+.np-item{{border:1px solid var(--border);border-radius:8px;padding:.6rem .7rem;
+margin:.45rem 0;font-size:.82rem;background:var(--paper)}}
+.np-item .q{{color:var(--muted);font-style:italic;display:block;margin-bottom:.25rem}}
+.np-item .n{{display:block;margin-bottom:.35rem;white-space:pre-wrap}}
+.np-item .np-row{{display:flex;gap:.7rem;font-size:.74rem}}
+.np-item .np-row a,.np-item .np-row button{{background:none;border:0;padding:0;
+cursor:pointer;font:inherit;color:var(--link)}}
+.np-item .np-row button:hover{{color:#B4544A}}
+.np-actions{{display:flex;gap:.5rem;margin-top:.4rem}}
+.np-actions button{{font:.76rem var(--sans);color:var(--ink);background:var(--paper);
+border:1px solid var(--border);border-radius:6px;padding:.35rem .7rem;cursor:pointer}}
+.np-actions button:hover{{border-color:var(--accent);color:var(--accent)}}
+/* ---- Ask AI chat sidebar ---- */
+#askpanel{{position:fixed;top:0;right:0;bottom:0;width:min(440px,96vw);z-index:55;
+background:var(--panel);border-left:1px solid var(--border);
+box-shadow:0 0 30px var(--shadow);font-family:var(--sans);
+display:flex;flex-direction:column;transform:translateX(100%);
+transition:transform .2s;visibility:hidden}}
+body.ask-open #askpanel{{transform:none;visibility:visible}}
+#askpanel .ap-head{{display:flex;align-items:center;gap:.5rem;
+padding:.85rem 1rem;border-bottom:1px solid var(--border);flex-shrink:0}}
+#askpanel .ap-head h2{{font:600 .95rem var(--sans);margin:0;flex:1}}
+#askpanel select{{font:.74rem var(--sans);color:var(--ink);background:var(--paper);
+border:1px solid var(--border);border-radius:6px;padding:.25rem .4rem;max-width:11rem}}
+#askpanel .ap-x{{font:1rem/1 var(--sans);color:var(--muted);background:none;
+border:1px solid var(--border);border-radius:6px;padding:.25rem .5rem;cursor:pointer}}
+#askpanel .ap-x:hover{{color:var(--ink);border-color:var(--muted)}}
+#askpanel .ap-quote{{margin:.8rem 1rem 0;padding:.4rem .7rem;font-size:.8rem;
+color:var(--muted);border-left:3px solid var(--accent);max-height:6.5em;
+overflow:auto;white-space:pre-wrap}}
+#askpanel .ap-log{{flex:1;overflow-y:auto;padding:.8rem 1rem;display:flex;
+flex-direction:column;gap:.6rem;min-height:0}}
+.ap-msg{{font-size:.86rem;line-height:1.55;border-radius:9px;padding:.55rem .75rem;
+white-space:pre-wrap;overflow-wrap:anywhere}}
+.ap-msg.user{{background:var(--tint);border:1px solid var(--border);
+align-self:flex-end;max-width:88%}}
+.ap-msg.ai{{background:var(--paper);border:1px solid var(--border)}}
+.ap-msg.err{{background:var(--paper);border:1px solid #B4544A;color:#B4544A;
+font-size:.8rem}}
+.ap-msg .who{{display:block;font-size:.66rem;letter-spacing:.08em;
+text-transform:uppercase;color:var(--muted);margin-bottom:.25rem}}
+.ap-msg.streaming::after{{content:"\u258F";animation:apblink 1s steps(2) infinite}}
+@keyframes apblink{{50%{{opacity:0}}}}
+#askpanel .ap-chips{{display:flex;flex-wrap:wrap;gap:.35rem;padding:0 1rem .1rem}}
+#askpanel .ap-chips button{{font:.72rem var(--sans);color:var(--muted);
+background:var(--paper);border:1px solid var(--border);border-radius:999px;
+padding:.22rem .6rem;cursor:pointer}}
+#askpanel .ap-chips button:hover{{color:var(--accent);border-color:var(--accent)}}
+#askpanel .ap-foot{{padding:.7rem 1rem 1rem;border-top:1px solid var(--border);
+flex-shrink:0}}
+#askpanel textarea{{width:100%;min-height:3.4em;max-height:9em;resize:vertical;
+font:.85rem var(--sans);color:var(--ink);background:var(--paper);
+border:1px solid var(--border);border-radius:7px;padding:.45rem .6rem}}
+#askpanel .ap-row{{display:flex;gap:.4rem;align-items:center;margin-top:.5rem}}
+#askpanel .ap-row .sp{{margin-right:auto;font-size:.7rem;color:var(--muted)}}
+#askpanel .ap-row button{{font:.78rem var(--sans);color:var(--ink);
+background:var(--paper);border:1px solid var(--border);border-radius:6px;
+padding:.3rem .7rem;cursor:pointer}}
+#askpanel .ap-row button:hover{{border-color:var(--accent);color:var(--accent)}}
+#askpanel .ap-row button:disabled{{opacity:.45;cursor:default;
+border-color:var(--border);color:var(--muted)}}
+.side-tools{{margin:-.3rem 0 .8rem;font-size:.78rem}}
+.side-tools a{{color:var(--muted)}}
+.side-tools a:hover{{color:var(--accent)}}
+
+/* An open side panel used to sit on top of the topbar, putting the Notes
+   button out of reach. With room to spare, give the panel its own space and
+   let the content column shrink instead. */
+.content{{transition:margin-right .2s}}
+@media(min-width:1100px){{
+body.ask-open .content{{margin-right:440px}}
+body.notes-open .content{{margin-right:360px}}}}
+
+/* ---- responsive ---- */
+@media(max-width:1150px){{.page-grid{{grid-template-columns:minmax(0,1fr)}}
+.outline{{display:none}}}}
+@media(max-width:860px){{
+nav.sidebar{{position:fixed;left:0;top:0;z-index:40;transform:translateX(-100%);
+transition:transform .2s;box-shadow:0 0 30px var(--shadow)}}
+body.nav-open nav.sidebar{{transform:none}}
+#menubtn{{display:block;background:none;border:1px solid var(--border);border-radius:6px;
+color:var(--ink);font-size:1rem;padding:.25rem .6rem;cursor:pointer;flex-shrink:0}}
+.topbar{{padding:.7rem 1.1rem}}
+.page-grid{{padding:0 1.1rem}}}}
+"""
+
+JS = """
+// ---- theme: auto -> light -> dark, persisted; data-theme wins over OS pref ----
+(()=>{const KEY='bookify-theme',root=document.documentElement;
+const btn=document.getElementById('themetoggle');
+const ICO={auto:'\\u25D0',light:'\\u2600',dark:'\\u263E'};
+let mode='auto';try{mode=localStorage.getItem(KEY)||'auto'}catch(e){}
+if(!(mode in ICO))mode='auto';
+const apply=()=>{if(mode==='auto')root.removeAttribute('data-theme');
+else root.setAttribute('data-theme',mode);
+if(btn)btn.textContent=ICO[mode]+' '+mode[0].toUpperCase()+mode.slice(1);};
+apply();
+if(btn)btn.addEventListener('click',()=>{mode={auto:'light',light:'dark',dark:'auto'}[mode];
+try{localStorage.setItem(KEY,mode)}catch(e){}apply();});})();
+
+// ---- sidebar filter ----
+(()=>{const q=document.getElementById('navfilter');if(!q)return;
+const tree=document.querySelector('nav.sidebar .tree');if(!tree)return;
+const groups=[...tree.querySelectorAll('details')];
+const wasOpen=new Map(groups.map(d=>[d,d.open]));
+let empty=null;
+q.addEventListener('input',()=>{const v=q.value.trim().toLowerCase();
+let hits=0;
+tree.querySelectorAll('li[data-t]').forEach(li=>{
+const on=!v||li.dataset.t.includes(v);li.hidden=!on;if(on)hits++});
+// a folder whose name matches counts as a hit and reveals its contents
+groups.forEach(d=>{const name=(d.querySelector('summary')||{}).textContent||'';
+const self=!!v&&name.toLowerCase().includes(v);
+if(self){d.querySelectorAll('li[data-t]').forEach(li=>{if(li.hidden){li.hidden=false;hits++}})}
+const kept=[...d.querySelectorAll('li[data-t]')].some(li=>!li.hidden);
+d.hidden=!!v&&!kept;
+d.open=v?kept:wasOpen.get(d)});
+if(!empty){empty=document.createElement('p');
+empty.style.cssText='font-size:.82rem;color:var(--muted);padding:.3rem .6rem';
+tree.appendChild(empty)}
+empty.textContent='No pages match \u201C'+q.value.trim()+'\u201D.';
+empty.hidden=!(v&&!hits)});})();
+
+// ---- mobile menu ----
+(()=>{const b=document.getElementById('menubtn');if(!b)return;
+b.addEventListener('click',e=>{e.stopPropagation();
+document.body.classList.toggle('nav-open')});
+document.addEventListener('click',e=>{
+if(document.body.classList.contains('nav-open')&&!e.target.closest('nav.sidebar'))
+document.body.classList.remove('nav-open')});})();
+
+// ---- "On this page" outline + scroll-spy ----
+(()=>{const list=document.getElementById('outline');
+const main=document.querySelector('main');if(!list||!main)return;
+const hs=[...main.querySelectorAll('h2,h3')];
+if(hs.length<2){const a=list.closest('aside');if(a)a.style.display='none';return}
+let n=0;hs.forEach(h=>{if(!h.id)h.id='s'+(n++)+'-'+
+h.textContent.trim().toLowerCase().replace(/[^\\w]+/g,'-').slice(0,40);
+const li=document.createElement('li');li.className=h.tagName.toLowerCase();
+const a=document.createElement('a');a.href='#'+h.id;a.textContent=h.textContent;
+li.appendChild(a);list.appendChild(li);});
+const byId=new Map([...list.querySelectorAll('a')].map(a=>[a.hash.slice(1),a]));
+const io=new IntersectionObserver(es=>{es.forEach(e=>{if(!e.isIntersecting)return;
+const a=byId.get(e.target.id);if(!a)return;
+list.querySelectorAll('a.active').forEach(x=>x.classList.remove('active'));
+a.classList.add('active');})},{rootMargin:'0px 0px -70% 0px'});
+hs.forEach(h=>io.observe(h));})();
+
+// ---- copy buttons on code blocks ----
+(()=>{document.querySelectorAll('main pre').forEach(pre=>{
+const wrap=document.createElement('div');wrap.className='codewrap';
+pre.parentNode.insertBefore(wrap,pre);wrap.appendChild(pre);
+const b=document.createElement('button');b.type='button';b.className='copy';
+b.setAttribute('aria-label','Copy code');
+b.addEventListener('click',()=>{
+navigator.clipboard.writeText(pre.innerText).then(()=>{b.classList.add('done');
+setTimeout(()=>b.classList.remove('done'),1200)}).catch(()=>{})});
+wrap.appendChild(b);});})();
+
+// ---- keyboard: arrows page through the book, "/" focuses the filter ----
+addEventListener('keydown',e=>{
+if(e.metaKey||e.ctrlKey||e.altKey||e.target.matches('input,textarea,select'))return;
+// paging away while the note editor or the chat is open would discard work
+if(document.querySelector('.bk-pop:not([hidden])'))return;
+if(document.body.classList.contains('ask-open'))return;
+if(e.key==='/'){const q=document.getElementById('navfilter');
+if(q){e.preventDefault();q.focus()}}
+else if(e.key==='ArrowLeft'){const a=document.querySelector('a.pager-card.prev');
+if(a)location.href=a.href}
+else if(e.key==='ArrowRight'){const a=document.querySelector('a.pager-card.next');
+if(a)location.href=a.href}});
+
+// ---- annotations: select text to highlight or attach a note. Anchored by
+// exact text + occurrence, painted via the CSS Custom Highlight API, and
+// persisted to the bookify server (falls back to localStorage elsewhere). ----
+(()=>{if(!('highlights'in CSS))return;
+const main=document.querySelector('main');if(!main)return;
+// depth-to-root, as emitted into <body data-root>
+const ROOT=document.body.dataset.root||'';
+// Key annotations by the page's path *within the book*, taking the last
+// depth+1 segments of the URL. The raw pathname would be an absolute
+// filesystem path under file:// and would carry any mount prefix when served
+// under a subpath; this way one key works everywhere, and ROOT+key is always a
+// link that resolves from the current page.
+const PAGE=(()=>{const d=ROOT.split('../').length-1;
+const segs=decodeURIComponent(location.pathname).split('/').filter(Boolean);
+return segs.slice(Math.max(0,segs.length-(d+1))).join('/')||'index.html'})();
+let db={version:1,pages:{}},remote=false,live=[];
+async function load(){try{const r=await fetch('/__annotations__',{cache:'no-store'});
+if(r.ok){db=await r.json();db.pages=db.pages||{};remote=true;return}}catch(e){}
+try{db=JSON.parse(localStorage.getItem('bookify-ann')||'{"pages":{}}')}catch(e){db={pages:{}}}}
+// Post only the pages this action touched and adopt the merged result, so a
+// second tab annotating another page can't clobber this one's work.
+async function save(pgs){const only=(pgs&&pgs.length)?pgs:[PAGE];
+if(remote){try{const r=await fetch('/__annotations__',{method:'POST',
+headers:{'Content-Type':'application/json'},
+body:JSON.stringify({merge:Object.fromEntries(only.map(k=>[k,db.pages[k]||[]]))})});
+if(r.ok){const j=await r.json();
+if(j&&j.pages){db=j;db.pages=db.pages||{}}return}}catch(e){}}
+try{localStorage.setItem('bookify-ann',JSON.stringify(db))}catch(e){}}
+
+// display only -- never store this, `exact` must stay verbatim to re-anchor
+const tidy=t=>String(t).replace(/\\s+/g,' ').trim();
+const nodes=()=>{const w=document.createTreeWalker(main,NodeFilter.SHOW_TEXT),a=[];
+let n;while(n=w.nextNode())a.push(n);return a};
+const fullText=ns=>ns.map(n=>n.data).join('');
+function makeRange(ns,s,e){const r=document.createRange();let pos=0,st=false;
+for(const n of ns){const L=n.data.length;
+if(!st&&s>=pos&&s<=pos+L){r.setStart(n,s-pos);st=true}
+if(st&&e>=pos&&e<=pos+L){r.setEnd(n,e-pos);return r}
+pos+=L}return null}
+function nth(txt,exact,occ){let i=-1;for(let k=0;k<=occ;k++){i=txt.indexOf(exact,i+1);
+if(i<0)return-1}return i}
+
+const hlPlain=new Highlight(),hlNote=new Highlight();
+CSS.highlights.set('bk-hl',hlPlain);CSS.highlights.set('bk-note',hlNote);
+function paint(){hlPlain.clear();hlNote.clear();live=[];
+const ns=nodes(),txt=fullText(ns);
+for(const a of db.pages[PAGE]||[]){const off=nth(txt,a.exact,a.occ||0);
+if(off<0)continue;const r=makeRange(ns,off,off+a.exact.length);if(!r)continue;
+(a.note?hlNote:hlPlain).add(r);live.push({a,r})}}
+
+// Measure a boundary as "characters of main's text before this point".
+// Range.toString() concatenates exactly the Text nodes the walker collects, so
+// this agrees with fullText() -- and unlike matching startContainer against a
+// text node it also handles element boundaries, which is what a triple-click or
+// a drag across block elements actually produces.
+function selOffsets(sel){if(sel.isCollapsed||!sel.rangeCount)return null;
+const r=sel.getRangeAt(0);
+if(!main.contains(r.commonAncestorContainer))return null;
+let s,e;try{const pre=document.createRange();pre.selectNodeContents(main);
+pre.setEnd(r.startContainer,r.startOffset);s=pre.toString().length;
+pre.setEnd(r.endContainer,r.endOffset);e=pre.toString().length}catch(err){return null}
+if(!(e>s))return null;
+return{s,e,txt:fullText(nodes())}}
+// annotations the current selection overlaps -- powers the Unhighlight action
+function overlapping(o){const out=[];
+for(const a of db.pages[PAGE]||[]){const off=nth(o.txt,a.exact,a.occ||0);
+if(off<0)continue;if(off<o.e&&off+a.exact.length>o.s)out.push(a)}return out}
+function annFromSelection(sel){const o=selOffsets(sel);if(!o)return null;
+const exact=o.txt.slice(o.s,o.e);
+let occ=0,i=o.txt.indexOf(exact);while(i>=0&&i<o.s){occ++;i=o.txt.indexOf(exact,i+1)}
+return{id:Date.now().toString(36)+Math.random().toString(36).slice(2,6),
+exact,occ,note:'',ts:Date.now()}}
+
+// selection toolbar
+const bar=document.createElement('div');bar.className='bk-bar';bar.hidden=true;
+bar.innerHTML='<button data-act="hl">Highlight</button><button data-act="note">Note</button>'+
+'<button data-act="ask">Ask AI</button>'+
+'<button class="danger" data-act="unhl">Unhighlight</button>';
+document.body.appendChild(bar);
+const unhl=bar.querySelector('[data-act="unhl"]');
+const askBtn=bar.querySelector('[data-act="ask"]');askBtn.style.display='none';
+function hideBar(){bar.hidden=true}
+main.addEventListener('mouseup',()=>setTimeout(()=>{const sel=getSelection();
+if(sel.isCollapsed||!main.contains(sel.anchorNode)){hideBar();return}
+const o=selOffsets(sel);unhl.style.display=o&&overlapping(o).length?'':'none';
+const rect=sel.getRangeAt(0).getBoundingClientRect();
+// measure while off-paint so the width-aware placement never flashes
+bar.style.visibility='hidden';bar.hidden=false;const w=bar.offsetWidth;
+bar.style.left=Math.max(8,Math.min(innerWidth-w-8,rect.left+rect.width/2-w/2))+'px';
+bar.style.top=(rect.bottom+scrollY+8)+'px';bar.style.visibility=''},0));
+document.addEventListener('mousedown',e=>{if(!e.target.closest('.bk-bar'))hideBar()});
+addEventListener('scroll',hideBar,{passive:true});
+
+// note editor popover. Dismissable four ways -- the X, the backdrop, Escape and
+// Cancel -- each resolving to null so the caller leaves the annotation untouched.
+const back=document.createElement('div');back.className='bk-back';back.hidden=true;
+document.body.appendChild(back);
+const pop=document.createElement('div');pop.className='bk-pop';pop.hidden=true;
+pop.setAttribute('role','dialog');pop.setAttribute('aria-modal','true');
+pop.innerHTML='<div class="head"><h3></h3><button class="x" data-act="cancel" '+
+'title="Close (Esc)" aria-label="Close">&#10005;</button></div>'+
+'<blockquote></blockquote><textarea placeholder="Add a note (optional)"></textarea>'+
+'<div class="row"><span class="hint">Esc to close</span>'+
+'<button data-act="ask">Ask AI</button>'+
+'<button class="danger" data-act="del">Remove highlight</button>'+
+'<button data-act="cancel">Cancel</button><button data-act="save">Save</button></div>';
+document.body.appendChild(pop);
+let closePop=null;
+function edit(quote,note,allowDelete){return new Promise(res=>{
+pop.querySelector('h3').textContent=allowDelete?'Annotation':'Add note';
+pop.querySelector('[data-act="ask"]').style.display=ASK.ok?'':'none';
+pop.querySelector('blockquote').textContent=tidy(quote);
+const ta=pop.querySelector('textarea');ta.value=note;
+pop.querySelector('.danger').style.display=allowDelete?'':'none';
+back.hidden=false;pop.hidden=false;ta.focus();
+closePop=r=>{if(!closePop)return;closePop=null;
+pop.hidden=true;back.hidden=true;pop.onclick=null;back.onmousedown=null;res(r)};
+pop.onclick=e=>{const act=e.target.dataset.act;if(!act)return;
+closePop(act==='save'?{note:ta.value.trim()}:act==='del'?{del:true}:
+act==='ask'?{ask:true,note:ta.value.trim()}:null)};
+back.onmousedown=()=>closePop(null)})}
+// Escape unwinds whatever is open, innermost first
+document.addEventListener('keydown',e=>{if(e.key!=='Escape')return;
+if(closePop){e.preventDefault();closePop(null);return}
+if(!bar.hidden){hideBar();return}
+if(document.body.classList.contains('ask-open')){
+if(inflight)inflight.abort();document.body.classList.remove('ask-open');return}
+if(document.body.classList.contains('notes-open'))
+document.body.classList.remove('notes-open')});
+
+bar.addEventListener('click',async e=>{const act=e.target.dataset.act;if(!act)return;
+const sel=getSelection();if(sel.isCollapsed)return;hideBar();
+if(act==='unhl'){const o=selOffsets(sel);if(!o)return;
+const kill=new Set(overlapping(o).map(a=>a.id));if(!kill.size)return;
+db.pages[PAGE]=(db.pages[PAGE]||[]).filter(a=>!kill.has(a.id));
+sel.removeAllRanges();await save();paint();panelRender();return}
+const ann=annFromSelection(sel);if(!ann)return;
+if(act==='ask'){const o=selOffsets(sel);
+const existing=o?overlapping(o)[0]:null;
+sel.removeAllRanges();askStart(ann.exact,existing);return}
+if(act==='note'){const r=await edit(ann.exact,'',false);if(!r||r.del)return;
+if(r.ask){sel.removeAllRanges();askStart(ann.exact,null);return}ann.note=r.note}
+(db.pages[PAGE]=db.pages[PAGE]||[]).push(ann);
+sel.removeAllRanges();await save();paint();panelRender()});
+
+// click a highlight to edit / remove it. The guard is "was this a drag?" rather
+// than "is the selection collapsed?" -- Chrome does not clear a stale selection
+// until after the click event, so the old test swallowed the first click on a
+// highlight whenever any text was still selected.
+let downAt=null;
+main.addEventListener('mousedown',e=>{downAt={x:e.clientX,y:e.clientY}});
+main.addEventListener('click',async e=>{const d=downAt;downAt=null;
+if(d&&(Math.abs(e.clientX-d.x)>3||Math.abs(e.clientY-d.y)>3))return;
+let node,off;if(document.caretRangeFromPoint){const c=document.caretRangeFromPoint(e.clientX,e.clientY);
+if(!c)return;node=c.startContainer;off=c.startOffset}
+else if(document.caretPositionFromPoint){const c=document.caretPositionFromPoint(e.clientX,e.clientY);
+if(!c)return;node=c.offsetNode;off=c.offset}else return;
+const hit=live.find(({r})=>{try{return r.isPointInRange(node,off)}catch(err){return false}});
+if(!hit)return;e.preventDefault();hideBar();getSelection().removeAllRanges();
+const r=await edit(hit.a.exact,hit.a.note||'',true);if(!r)return;
+if(r.ask){askStart(hit.a.exact,hit.a);return}
+if(r.del)db.pages[PAGE]=(db.pages[PAGE]||[]).filter(x=>x.id!==hit.a.id);
+else hit.a.note=r.note;
+await save();paint();panelRender()});
+
+// ---- Ask AI: a chat sidebar about the highlighted passage. Multi-turn, so
+// follow-ups and push-back work; the backend is whatever this machine has
+// (Ollama, else an installed assistant CLI), chosen by the server. ----
+const ASK={ok:false,token:'',providers:[],id:null};
+const askPanel=document.createElement('aside');askPanel.id='askpanel';
+askPanel.innerHTML=
+'<div class="ap-head"><h2>Ask AI</h2><select aria-label="Backend"></select>'+
+'<button class="ap-x" data-act="close" title="Close (Esc)" aria-label="Close">&#10005;</button></div>'+
+'<blockquote class="ap-quote"></blockquote>'+
+'<div class="ap-log"></div>'+
+'<div class="ap-chips"></div>'+
+'<div class="ap-foot"><textarea rows="2" placeholder="Ask about this passage, or push back\u2026"></textarea>'+
+'<div class="ap-row"><span class="sp"></span>'+
+'<button data-act="note">Save answer to notes</button>'+
+'<button data-act="stop">Stop</button>'+
+'<button data-act="send">Send</button></div></div>';
+document.body.appendChild(askPanel);
+const apLog=askPanel.querySelector('.ap-log');
+const apQuote=askPanel.querySelector('.ap-quote');
+const apInput=askPanel.querySelector('textarea');
+const apSel=askPanel.querySelector('select');
+const apChips=askPanel.querySelector('.ap-chips');
+const apStatus=askPanel.querySelector('.sp');
+const apBtn=a=>askPanel.querySelector('[data-act="'+a+'"]');
+const PRESETS=['Explain this simply','Why does this matter?','Define the jargon',
+'What could go wrong?','Give an example'];
+let chat={quote:'',context:'',msgs:[],ann:null},inflight=null;
+
+function askOpen(open){document.body.classList.toggle('ask-open',open!==false);
+if(open!==false)document.body.classList.remove('notes-open')}
+
+function apRender(){apLog.innerHTML='';
+for(const m of chat.msgs){const d=document.createElement('div');
+d.className='ap-msg '+(m.role==='user'?'user':m.role==='error'?'err':'ai');
+if(m.role!=='user'){const w=document.createElement('span');w.className='who';
+w.textContent=m.role==='error'?'Problem':(ASK.label||'AI');d.appendChild(w)}
+d.appendChild(document.createTextNode(m.content));
+if(m.streaming)d.classList.add('streaming');
+apLog.appendChild(d)}
+apLog.scrollTop=apLog.scrollHeight;
+apBtn('stop').disabled=!inflight;apBtn('send').disabled=!!inflight;
+apBtn('note').disabled=!chat.msgs.some(m=>m.role==='ai'&&m.content.trim())}
+
+// context around the passage, so answers are grounded in the page
+function askContext(exact){const txt=fullText(nodes());
+const i=txt.indexOf(exact);if(i<0)return exact;
+return txt.slice(Math.max(0,i-700),Math.min(txt.length,i+exact.length+700))}
+
+function askStart(quote,ann){chat={quote,context:askContext(quote),msgs:[],ann:ann||null};
+apQuote.textContent=tidy(quote);apChips.innerHTML='';
+for(const t of PRESETS){const b=document.createElement('button');b.type='button';
+b.textContent=t;b.onclick=()=>askSend(t);apChips.appendChild(b)}
+apStatus.textContent='';apRender();askOpen(true);
+apInput.value='';setTimeout(()=>apInput.focus(),120);
+askSend('Explain this passage.',true)}
+
+async function askSend(text,silent){const q=(text||'').trim();
+if(!q||inflight||!ASK.ok)return;
+if(!silent)chat.msgs.push({role:'user',content:q});
+else chat.msgs.push({role:'user',content:q,hidden:false});
+const slot={role:'ai',content:'',streaming:true};chat.msgs.push(slot);
+apInput.value='';apStatus.textContent='thinking\u2026';
+const ctrl=new AbortController();inflight=ctrl;apRender();
+try{const r=await fetch('/__ask__',{method:'POST',signal:ctrl.signal,
+headers:{'Content-Type':'application/json'},
+body:JSON.stringify({token:ASK.token,provider:ASK.id,quote:chat.quote,
+context:chat.context,book:document.title,title:(document.querySelector('main h1')||{}).textContent||'',
+messages:chat.msgs.filter(m=>m.role==='user'||(m.role==='ai'&&m.content))
+.map(m=>({role:m.role==='user'?'user':'assistant',content:m.content}))})});
+if(!r.ok){let msg='request failed ('+r.status+')';
+try{const j=await r.json();if(j&&j.error)msg=j.error}catch(e){}
+throw new Error(msg)}
+const rd=r.body.getReader(),dec=new TextDecoder();let buf='';
+for(;;){const{value,done}=await rd.read();if(done)break;
+buf+=dec.decode(value,{stream:true});
+const lines=buf.split('\\n');buf=lines.pop();
+for(const ln of lines){if(!ln.trim())continue;let o;
+try{o=JSON.parse(ln)}catch(e){continue}
+if(o.error)throw new Error(o.error);
+if(o.t){slot.content+=o.t;apStatus.textContent='';apRender()}}}
+if(!slot.content.trim())throw new Error('no answer came back');}
+catch(err){const aborted=err&&err.name==='AbortError';
+if(!slot.content.trim())chat.msgs.splice(chat.msgs.indexOf(slot),1);
+if(!aborted)chat.msgs.push({role:'error',content:String(err&&err.message||err)});}
+finally{slot.streaming=false;inflight=null;apStatus.textContent='';apRender()}}
+
+askPanel.addEventListener('click',async e=>{
+const act=e.target.dataset.act;if(!act)return;
+if(act==='close'){if(inflight)inflight.abort();askOpen(false);return}
+if(act==='stop'){if(inflight)inflight.abort();return}
+if(act==='send'){askSend(apInput.value);return}
+if(act==='note'){const last=[...chat.msgs].reverse().find(m=>m.role==='ai'&&m.content.trim());
+if(!last)return;
+let a=chat.ann&&(db.pages[PAGE]||[]).find(x=>x.id===chat.ann.id);
+if(!a){a=annFromText(chat.quote);if(!a){apStatus.textContent='could not anchor that passage';return}
+(db.pages[PAGE]=db.pages[PAGE]||[]).push(a);chat.ann=a}
+a.note=(a.note?a.note+'\\n\\n':'')+'AI: '+last.content.trim();
+await save();paint();panelRender();apStatus.textContent='saved to notes'}});
+apInput.addEventListener('keydown',e=>{
+if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();askSend(apInput.value)}});
+apSel.addEventListener('change',()=>{ASK.id=apSel.value;
+const p=ASK.providers.find(x=>x.id===ASK.id);ASK.label=p?p.label:'AI'});
+
+// build an annotation for text we already know is on the page
+function annFromText(exact){const txt=fullText(nodes());
+if(txt.indexOf(exact)<0)return null;
+return{id:Date.now().toString(36)+Math.random().toString(36).slice(2,6),
+exact,occ:0,note:'',ts:Date.now()}}
+
+(async()=>{try{const r=await fetch('/__ask__',{cache:'no-store'});
+if(!r.ok)return;const j=await r.json();
+ASK.token=j.token||'';ASK.providers=(j.providers||[]).filter(p=>!p.unavailable);
+ASK.ok=!!j.ok&&!!ASK.providers.length;ASK.id=j.default||null;
+const p=ASK.providers.find(x=>x.id===ASK.id);ASK.label=p?p.label:'AI';
+if(!ASK.ok)return;
+askBtn.style.display='';
+apSel.innerHTML=ASK.providers.map(x=>'<option value="'+x.id+'">'+
+x.label+(x.detail?' \u00b7 '+x.detail:'')+'</option>').join('');
+apSel.value=ASK.id}catch(e){}})();
+
+// notes panel
+const panel=document.createElement('aside');panel.id='notespanel';
+document.body.appendChild(panel);
+const btn=document.getElementById('notesbtn');
+if(btn)btn.addEventListener('click',()=>{
+document.body.classList.remove('ask-open');
+document.body.classList.toggle('notes-open')});
+document.addEventListener('mousedown',e=>{
+if(!document.body.classList.contains('notes-open'))return;
+if(e.target.closest('#notespanel')||e.target.closest('#notesbtn'))return;
+document.body.classList.remove('notes-open')});
+function panelRender(){const entries=Object.entries(db.pages)
+.map(([pg,list])=>[pg,list||[]]).filter(([,l])=>l.length);
+const count=entries.reduce((n,[,l])=>n+l.length,0);
+if(btn)btn.textContent='Notes'+(count?' ('+count+')':'');
+let h='<div class="np-head"><h2>Annotations</h2>'+
+'<button class="np-x" data-act="close" title="Close (Esc)" aria-label="Close">&#10005;</button></div>';
+if(!count)h+='<p style="font-size:.82rem;color:var(--muted)">Select any text in a page to '+
+'highlight it or attach a note. Click a highlight (or re-select it) to edit or remove it.</p>';
+const esc=t=>String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;')
+.replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+for(const[pg,list]of entries){h+='<div class="np-page">'+esc(pg)+'</div>';
+for(const a of list){h+='<div class="np-item"><span class="q">&ldquo;'+
+esc(tidy(a.exact).slice(0,140))+(tidy(a.exact).length>140?'&hellip;':'')+'&rdquo;</span>'+
+(a.note?'<span class="n">'+esc(a.note)+'</span>':'')+
+'<div class="np-row"><a href="'+esc(ROOT+pg)+'">Open page</a>'+
+'<button data-del="'+esc(pg+'|'+a.id)+'">Delete</button></div></div>'}}
+h+='<div class="np-actions"><button data-act="export">Export Markdown</button></div>';
+panel.innerHTML=h}
+panel.addEventListener('click',async e=>{
+if(e.target.dataset.act==='close'){document.body.classList.remove('notes-open');return}
+if(e.target.dataset.act==='export'){let md='# Annotations\\n';
+for(const[pg,list]of Object.entries(db.pages)){if(!(list||[]).length)continue;
+md+='\\n## '+pg+'\\n';for(const a of list){md+='\\n> '+a.exact.trim()+'\\n';
+if(a.note)md+='\\n'+a.note+'\\n'}}
+const u=URL.createObjectURL(new Blob([md],{type:'text/markdown'}));
+const a=document.createElement('a');a.href=u;a.download='annotations.md';
+document.body.appendChild(a);a.click();a.remove();
+setTimeout(()=>URL.revokeObjectURL(u),1000);return}
+const d=e.target.dataset.del;if(!d)return;
+const[pg,id]=d.split('|');db.pages[pg]=(db.pages[pg]||[]).filter(x=>x.id!==id);
+await save([pg]);paint();panelRender()});
+
+load().then(()=>{paint();panelRender()})})();
+
+// ---- liveness: each tab holds an open SSE connection so `bookify` can stop
+// its server when the last tab closes. A connection (unlike timers) is never
+// throttled in background tabs. No-ops under file:// or other static hosts. ----
+(()=>{if(location.protocol!=='http:'&&location.protocol!=='https:')return;
+if(!window.EventSource)return;
+let opened=false,fails=0;
+const es=new EventSource('/__watch__');
+es.onopen=()=>{opened=true;fails=0};
+// Never connected => not bookify's server, stop at once. Connected then
+// dropped => allow a few auto-reconnects (waking from sleep, a rebuild), but
+// give up after that: once bookify has exited, retrying forever just hammers
+// localhost and fills the console with failed requests.
+es.onerror=()=>{if(!opened||++fails>5)es.close()};})();
+"""
+
+# applied before first paint so a stored theme choice never flashes the other theme
+THEME_INIT = ("try{var t=localStorage.getItem('bookify-theme');"
+              "if(t==='light'||t==='dark')"
+              "document.documentElement.setAttribute('data-theme',t)}catch(e){}")
+
+
+def build_tree(pages: list[Page]) -> dict:
+    tree: dict = {"dirs": {}, "pages": []}
+    for p in pages:
+        node = tree
+        for part in p.rel.parts[:-1]:
+            node = node["dirs"].setdefault(part, {"dirs": {}, "pages": []})
+        node["pages"].append(p)
+    return tree
+
+
+def nav_html(tree: dict, current: Page, depth_to_root: str) -> str:
+    out = ["<ul>"]
+    for p in tree["pages"]:
+        active = ' class="active"' if p is current else ""
+        href = depth_to_root + str(p.out_rel_html).replace("\\", "/")
+        out.append(
+            f'<li data-t="{html_mod.escape(p.title.lower())}">'
+            f'<a href="{href}"{active}>{html_mod.escape(p.title)}</a></li>'
+        )
+    for name, sub in sorted(tree["dirs"].items(), key=lambda kv: kv[0].lower()):
+        is_open = " open" if str(current.rel).startswith(name) or _contains(sub, current) else ""
+        out.append(f"<details{is_open}><summary>{html_mod.escape(humanize(name))}</summary>")
+        out.append(nav_html(sub, current, depth_to_root))
+        out.append("</details>")
+    out.append("</ul>")
+    return "".join(out)
+
+
+def _contains(tree: dict, page: Page) -> bool:
+    if any(p is page for p in tree["pages"]):
+        return True
+    return any(_contains(sub, page) for sub in tree["dirs"].values())
+
+
+def write_html_book(pages: list[Page], tree: dict, out: Path, title: str) -> None:
+    light_hl = HtmlFormatter(style="default").get_style_defs(".highlight")
+    dark_fmt = HtmlFormatter(style="github-dark")
+    hl_css = (
+        light_hl
+        + "\n@media(prefers-color-scheme:dark){"
+        + dark_fmt.get_style_defs(':root:not([data-theme="light"]) .highlight') + "}\n"
+        + dark_fmt.get_style_defs(':root[data-theme="dark"] .highlight')
+        # pygments sets its own backgrounds/line-height; the book's tokens win
+        + "\n.highlight{background:transparent!important}"
+        + "\n.highlight pre{line-height:1.55;background:var(--code-bg)}"
+    )
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "book.css").write_text(CSS + "\n" + hl_css, encoding="utf-8")
+    (out / "book.js").write_text(JS, encoding="utf-8")
+
+    for page in pages:
+        dest = out / page.out_rel_html
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        to_root = "../" * (len(page.out_rel_html.parts) - 1)
+        crumb_parts = [title] + [humanize(p) for p in page.rel.parts[:-1]] + [page.title]
+        crumbs = '<span class="sep">/</span>'.join(html_mod.escape(c) for c in crumb_parts)
+        pager = []
+        if page.prev:
+            href = to_root + str(page.prev.out_rel_html).replace("\\", "/")
+            pager.append(
+                f'<a class="pager-card prev" href="{href}">'
+                f'<span class="pager-eyebrow">&larr; Previous</span>'
+                f'<span class="pager-title">{html_mod.escape(page.prev.title)}</span></a>')
+        if page.next:
+            href = to_root + str(page.next.out_rel_html).replace("\\", "/")
+            pager.append(
+                f'<a class="pager-card next" href="{href}">'
+                f'<span class="pager-eyebrow">Next &rarr;</span>'
+                f'<span class="pager-title">{html_mod.escape(page.next.title)}</span></a>')
+        doc = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{html_mod.escape(page.title)} — {html_mod.escape(title)}</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>📖</text></svg>">
+<script>{THEME_INIT}</script>
+<link rel="stylesheet" href="{to_root}book.css"><script src="{to_root}book.js" defer></script>
+</head><body data-root="{to_root}"><div class="layout">
+<nav class="sidebar">
+<div class="side-head"><a class="brand" href="{to_root}index.html">{html_mod.escape(title)}</a>
+<button id="themetoggle" type="button" title="Cycle theme: auto / light / dark">&#9680;</button></div>
+<input id="navfilter" type="search" placeholder="Filter pages&hellip;">
+<div class="side-tools"><a href="{to_root}__map__.html">Book map</a></div>
+<div class="tree">{nav_html(tree, page, to_root)}</div>
+</nav>
+<div class="content">
+<div class="topbar"><button id="menubtn" type="button" aria-label="Toggle navigation">&#9776;</button>
+<div class="crumbs">{crumbs}</div>
+<button id="notesbtn" type="button">Notes</button></div>
+<div class="page-grid">
+<main>
+{page.html_body}
+<nav class="pager">{"".join(pager)}</nav>
+</main>
+<aside class="outline"><div class="outline-head">On this page</div>
+<ul id="outline"></ul></aside>
+</div></div>
+</div></body></html>"""
+        dest.write_text(doc, encoding="utf-8")
+
+    # index.html: redirect to the first page (unless a real index.html page exists)
+    if pages and not any(str(p.out_rel_html) == "index.html" for p in pages):
+        first = str(pages[0].out_rel_html).replace("\\", "/")
+        (out / "index.html").write_text(
+            f'<!doctype html><meta charset="utf-8">'
+            f'<link rel="icon" href="data:,">'
+            f'<meta http-equiv="refresh" content="0; url={first}">'
+            f'<a href="{first}">Open book</a>', encoding="utf-8")
+
+
+# ----------------------------------------------------------------------------
+# Book map (interactive mind-map of structure + cross-links)
+
+def write_map_page(pages: list[Page], out: Path, title: str) -> None:
+    import json as jsonlib
+
+    nodes = [{"id": "", "label": title, "kind": "root"}]
+    folders = sorted({"/".join(p.rel.parts[:i])
+                      for p in pages for i in range(1, len(p.rel.parts))})
+    nodes += [{"id": "dir:" + f, "label": humanize(f.rsplit("/", 1)[-1]),
+               "kind": "dir"} for f in folders]
+    page_ids = set()
+    for p in pages:
+        pid = str(p.out_rel_html).replace("\\", "/")
+        page_ids.add(pid)
+        nodes.append({"id": pid, "label": p.title, "kind": "page", "href": pid})
+
+    edges = []
+    for f in folders:
+        parent = "dir:" + f.rsplit("/", 1)[0] if "/" in f else ""
+        edges.append({"s": parent, "t": "dir:" + f, "kind": "tree"})
+    for p in pages:
+        pid = str(p.out_rel_html).replace("\\", "/")
+        parent = "dir:" + "/".join(p.rel.parts[:-1]) if len(p.rel.parts) > 1 else ""
+        edges.append({"s": parent, "t": pid, "kind": "tree"})
+    seen = set()
+    for p in pages:
+        pid = str(p.out_rel_html).replace("\\", "/")
+        base = posixpath.dirname(pid)
+        for href in re.findall(r'href="([^"#]+)"', p.html_body):
+            if href.startswith(("http://", "https://", "mailto:", "/", "data:")):
+                continue
+            t = posixpath.normpath(posixpath.join(base, href))
+            if t in page_ids and t != pid and (pid, t) not in seen:
+                seen.add((pid, t))
+                edges.append({"s": pid, "t": t, "kind": "link"})
+
+    graph = jsonlib.dumps({"nodes": nodes, "edges": edges})
+    doc = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Map — {html_mod.escape(title)}</title>
+<link rel="icon" href="data:,"><script>{THEME_INIT}</script>
+<link rel="stylesheet" href="book.css">
+<style>html,body{{height:100%;overflow:hidden}}
+#mapbar{{position:fixed;top:0;left:0;right:0;z-index:5;display:flex;gap:1rem;
+align-items:baseline;padding:.8rem 1.2rem;font-family:var(--sans)}}
+#mapbar .hint{{font-size:.74rem;color:var(--muted)}}
+canvas{{display:block}}</style></head><body>
+<div id="mapbar"><a href="index.html">&larr; {html_mod.escape(title)}</a>
+<strong style="font-family:var(--serif)">Book map</strong>
+<span class="hint">drag nodes &middot; scroll to zoom &middot; click a page to open it</span></div>
+<canvas id="c"></canvas>
+<script>
+const G={graph};
+const cv=document.getElementById('c'),ctx=cv.getContext('2d');
+let W,H,DPR=devicePixelRatio||1,zoom=1,panX=0,panY=0;
+function resize(){{W=innerWidth;H=innerHeight;cv.width=W*DPR;cv.height=H*DPR;
+cv.style.width=W+'px';cv.style.height=H+'px'}}resize();
+// setting canvas.width clears the bitmap, so a resize must repaint or the map
+// goes blank until the next mouse move
+onresize=()=>{{resize();wake(0.1)}};
+const R={{root:16,dir:10,page:6}};
+const N=G.nodes.map((n,i)=>({{...n,
+x:W/2+Math.cos(i*2.4)*(60+i*7),y:H/2+Math.sin(i*2.4)*(60+i*7),vx:0,vy:0}}));
+const byId=new Map(N.map(n=>[n.id,n]));
+const E=G.edges.map(e=>({{s:byId.get(e.s),t:byId.get(e.t),kind:e.kind}}))
+.filter(e=>e.s&&e.t);
+let alpha=1;
+function tick(){{
+for(let i=0;i<N.length;i++)for(let j=i+1;j<N.length;j++){{
+const a=N[i],b=N[j];let dx=b.x-a.x,dy=b.y-a.y,d2=dx*dx+dy*dy||1;
+if(d2<160000){{const f=1800/d2;const d=Math.sqrt(d2);dx/=d;dy/=d;
+a.vx-=dx*f;a.vy-=dy*f;b.vx+=dx*f;b.vy+=dy*f}}}}
+for(const e of E){{const k=e.kind==='tree'?0.02:0.004,L=e.kind==='tree'?110:170;
+let dx=e.t.x-e.s.x,dy=e.t.y-e.s.y,d=Math.sqrt(dx*dx+dy*dy)||1;
+const f=k*(d-L)/d;e.s.vx+=dx*f;e.s.vy+=dy*f;e.t.vx-=dx*f;e.t.vy-=dy*f}}
+for(const n of N){{if(n===drag)continue;
+n.vx+=(W/2-n.x)*0.0008;n.vy+=(H/2-n.y)*0.0008;
+n.x+=n.vx*alpha;n.y+=n.vy*alpha;n.vx*=0.85;n.vy*=0.85}}
+alpha=Math.max(0.05,alpha*0.995)}}
+function css(v){{return getComputedStyle(document.documentElement)
+.getPropertyValue(v).trim()}}
+function draw(){{const ink=css('--ink'),muted=css('--muted'),acc=css('--accent'),
+border=css('--border'),paper=css('--paper');
+ctx.setTransform(DPR,0,0,DPR,0,0);ctx.fillStyle=paper;ctx.fillRect(0,0,W,H);
+ctx.translate(panX,panY);ctx.scale(zoom,zoom);
+for(const e of E){{ctx.beginPath();ctx.moveTo(e.s.x,e.s.y);ctx.lineTo(e.t.x,e.t.y);
+ctx.strokeStyle=e.kind==='tree'?border:acc;
+ctx.globalAlpha=e.kind==='tree'?1:.45;
+ctx.setLineDash(e.kind==='link'?[4,4]:[]);ctx.lineWidth=1.2/zoom;ctx.stroke()}}
+ctx.setLineDash([]);ctx.globalAlpha=1;
+for(const n of N){{ctx.beginPath();ctx.arc(n.x,n.y,R[n.kind],0,7);
+ctx.fillStyle=n.kind==='page'?muted:acc;ctx.fill();
+if(n===hover&&n.kind==='page'){{ctx.strokeStyle=acc;ctx.lineWidth=2/zoom;ctx.stroke()}}
+ctx.fillStyle=n.kind==='root'?ink:n===hover?ink:muted;
+ctx.font=(n.kind==='root'?'700 14px':n.kind==='dir'?'600 12px':'11px')+' '+css('--sans');
+ctx.textAlign='center';ctx.fillText(n.label.slice(0,34),n.x,n.y+R[n.kind]+14)}}}}
+let drag=null,hover=null,panning=false,px,py,downX,downY,moved=false;
+function pick(e){{const x=(e.clientX-panX)/zoom,y=(e.clientY-panY)/zoom;
+return N.find(n=>(n.x-x)**2+(n.y-y)**2<Math.max(R[n.kind]+6,12)**2)}}
+let running=false;
+function loop(){{tick();draw();
+if(alpha>0.06||drag||panning){{requestAnimationFrame(loop)}}else{{running=false;draw()}}}}
+function wake(a){{alpha=Math.max(alpha,a||0.3);
+if(!running){{running=true;requestAnimationFrame(loop)}}}}
+cv.onmousedown=e=>{{drag=pick(e);if(!drag){{panning=true}}
+px=downX=e.clientX;py=downY=e.clientY;moved=false;wake(0.1)}};
+cv.onmousemove=e=>{{const h=pick(e);
+if(h!==hover){{hover=h;cv.style.cursor=hover?'pointer':'default';if(!running)draw()}}
+// measure travel from the press, not from the last move event, or every drag
+// still looks like a click
+if(Math.abs(e.clientX-downX)>3||Math.abs(e.clientY-downY)>3)moved=true;
+if(drag){{drag.x+=(e.clientX-px)/zoom;drag.y+=(e.clientY-py)/zoom;wake(0.6)}}
+else if(panning){{panX+=e.clientX-px;panY+=e.clientY-py;if(!running)draw()}}
+px=e.clientX;py=e.clientY}};
+// a single mouseup handler decides: a press that stayed put opens the page, a
+// press that travelled was a drag and must not navigate
+cv.onmouseup=e=>{{const n=drag;const wasDrag=moved;drag=null;panning=false;
+if(!wasDrag&&n&&n.href)location.href=n.href}};
+cv.onwheel=e=>{{e.preventDefault();const f=e.deltaY<0?1.1:0.9;
+const z=Math.min(6,Math.max(0.15,zoom*f)),g=z/zoom;
+panX=e.clientX-(e.clientX-panX)*g;panY=e.clientY-(e.clientY-panY)*g;zoom=z;
+if(!running)draw()}};
+wake(1);
+</script></body></html>"""
+    (out / "__map__.html").write_text(doc, encoding="utf-8")
+
+
+# ----------------------------------------------------------------------------
+# Optional AI overview via a local Ollama server
+
+AI_DEFAULT_MODEL = "llama3.2:3b"
+# override to point at Ollama somewhere else (another port, another machine)
+OLLAMA_BASE = os.environ.get("BOOKIFY_OLLAMA", "http://127.0.0.1:11434").rstrip("/")
+
+
+def ollama_models(timeout: float = 3) -> "list[str] | None":
+    """Names of pulled models, or None if Ollama isn't reachable."""
+    import json as jsonlib
+    import urllib.request
+    try:
+        with urllib.request.urlopen(OLLAMA_BASE + "/api/tags", timeout=timeout) as r:
+            return [m["name"] for m in jsonlib.loads(r.read()).get("models", [])]
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def pick_model(want: str, names: list[str]) -> "str | None":
+    """The wanted model if pulled (bare name matches any tag), else the first."""
+    for n in names:
+        if n == want or n.startswith(want + ":"):
+            return n
+    return names[0] if names else None
+
+
+def ai_overview(pages: list[Page], out: Path, title: str, model: str) -> "Page | None":
+    import json as jsonlib
+    import urllib.error
+    import urllib.request
+
+    base = OLLAMA_BASE
+
+    def post(path: str, payload: dict, timeout: int = 300) -> dict:
+        req = urllib.request.Request(
+            base + path, data=jsonlib.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return jsonlib.loads(r.read())
+
+    names = ollama_models()
+    if names is None:
+        print(f"bookify: --ai skipped — Ollama is not reachable at {base}.\n"
+              "  Install: brew install ollama   Start: ollama serve\n"
+              f"  Pull a small model: ollama pull {AI_DEFAULT_MODEL}", file=sys.stderr)
+        return None
+    if not names:
+        print(f"bookify: --ai skipped — no models pulled. "
+              f"Run: ollama pull {model}", file=sys.stderr)
+        return None
+    chosen = pick_model(model, names)
+    if chosen != model:
+        model = chosen
+        print(f"bookify: requested model not pulled; using '{model}'. "
+              f"(Lighter option: ollama pull {AI_DEFAULT_MODEL})", file=sys.stderr)
+
+    cache_f = out / "ai-cache.json"   # keyed by content hash; survives rebuilds
+    try:
+        cache = jsonlib.loads(cache_f.read_text()) if cache_f.exists() else {}
+    except ValueError:
+        cache = {}
+
+    todo = pages[:60]
+    if len(pages) > 60:
+        print(f"bookify: --ai summarizing the first 60 of {len(pages)} pages")
+    summaries = []
+    for i, p in enumerate(todo, 1):
+        key = hashlib.sha1((model + "\x00" + p.md_body).encode()).hexdigest()
+        if key not in cache:
+            print(f"  [{i}/{len(todo)}] summarizing {p.rel} …")
+            prompt = ("Summarize this documentation page in 2-3 plain sentences "
+                      "for a reader deciding whether to open it. No preamble, "
+                      "no markdown.\n\n# " + p.title + "\n\n" + p.md_body[:6000])
+            try:
+                cache[key] = post("/api/generate", {
+                    "model": model, "prompt": prompt, "stream": False,
+                }).get("response", "").strip()
+                cache_f.write_text(jsonlib.dumps(cache))
+            except OSError as exc:
+                print(f"bookify: ollama error ({exc}); continuing without AI overview",
+                      file=sys.stderr)
+                return None
+        summaries.append((p, cache[key]))
+
+    joined = "\n".join(f"- {p.title}: {s}" for p, s in summaries)
+    key = hashlib.sha1((model + "\x01" + joined).encode()).hexdigest()
+    if key not in cache:
+        try:
+            cache[key] = post("/api/generate", {
+                "model": model, "stream": False,
+                "prompt": "In one short paragraph (3-4 sentences), describe what "
+                          "this documentation covers overall, based on these page "
+                          "summaries. No preamble.\n\n" + joined[:8000],
+            }).get("response", "").strip()
+            cache_f.write_text(jsonlib.dumps(cache))
+        except OSError:
+            cache[key] = ""
+    abstract = cache[key]
+
+    def build(links: dict) -> str:
+        md = [f"# {title}: Overview", "",
+              f"*Summaries generated locally by Ollama (`{model}`).*", ""]
+        if abstract:
+            md += [abstract, ""]
+        md += ["## Pages", ""]
+        for p, s in summaries:
+            md += [f"### [{p.title}]({links[id(p)]})", "", s, ""]
+        return "\n".join(md)
+
+    ov = Page(src=out, rel=Path("__overview__.md"), title="Overview (AI)", kind="md")
+    MD_RENDERER.reset()
+    ov.html_body = MD_RENDERER.convert(
+        build({id(p): str(p.out_rel_html).replace("\\", "/") for p, _ in summaries}))
+    ov.md_body = build(
+        {id(p): str(p.out_rel_md).replace("\\", "/") for p, _ in summaries})
+    return ov
+
+
+# ----------------------------------------------------------------------------
+# "Ask AI": answer questions about a highlighted passage, using whatever the
+# machine already has. Ollama is preferred (local, free, streams token by
+# token); otherwise we shell out to an installed assistant CLI.
+
+ASK_TIMEOUT = 240
+
+# id -> (label, argv builder, streams?).  argv builders take the flattened
+# prompt and a path for the provider to write its final message to.
+CLI_PROVIDERS = {
+    "claude": {
+        "label": "Claude Code",
+        "argv": lambda prompt, out: ["claude", "-p", prompt],
+        "stream": True,
+    },
+    "codex": {
+        "label": "Codex",
+        # writes just the final message to `out`; stdout is progress chrome
+        "argv": lambda prompt, out: ["codex", "exec", "--skip-git-repo-check",
+                                     "--color", "never", "-o", out, prompt],
+        "stream": False,
+    },
+    "gemini": {
+        "label": "Gemini",
+        "argv": lambda prompt, out: ["gemini", "-o", "text", "-p", prompt],
+        "stream": True,
+    },
+}
+CLI_ORDER = ["claude", "codex", "gemini"]
+
+
+def detect_providers(ask_model: str) -> list[dict]:
+    """Everything on this machine that can answer a question, best first."""
+    found = []
+    names = ollama_models()
+    if names:
+        model = pick_model(ask_model, names)
+        found.append({"id": "ollama", "label": "Ollama",
+                      "detail": model, "streams": True})
+    elif names is not None:
+        found.append({"id": "ollama", "label": "Ollama", "streams": True,
+                      "detail": "no model pulled", "unavailable":
+                      f"Ollama is running but has no model. Run: ollama pull {AI_DEFAULT_MODEL}"})
+    for pid in CLI_ORDER:
+        if shutil.which(pid):
+            found.append({"id": pid, "label": CLI_PROVIDERS[pid]["label"],
+                          "detail": "CLI", "streams": CLI_PROVIDERS[pid]["stream"]})
+    found.sort(key=lambda p: bool(p.get("unavailable")))
+    return found
+
+
+def build_ask_prompt(payload: dict) -> str:
+    """Flatten the passage, its context and the conversation into one prompt.
+
+    The assistant CLIs are stateless per invocation, so every turn resends the
+    transcript — that is what makes follow-up questions and disagreement work.
+    """
+    quote = str(payload.get("quote") or "")[:4000]
+    context = str(payload.get("context") or "")[:4000]
+    book = str(payload.get("book") or "")[:200]
+    page = str(payload.get("title") or "")[:200]
+    msgs = payload.get("messages") or []
+
+    head = ["You are helping a reader understand a passage from documentation.",
+            "Answer from the passage and its surrounding context where you can.",
+            "Say plainly when something is not covered by the text rather than "
+            "inventing it. Be concise and concrete; plain prose, minimal markdown.",
+            "The reader may push back or disagree — engage with the argument."]
+    if book:
+        head.append(f"Book: {book}")
+    if page:
+        head.append(f"Page: {page}")
+    head += ["", "HIGHLIGHTED PASSAGE:", quote]
+    if context and context != quote:
+        head += ["", "SURROUNDING CONTEXT:", context]
+    head += ["", "CONVERSATION:"]
+    for m in msgs[-20:]:
+        role = "Reader" if m.get("role") == "user" else "Assistant"
+        head.append(f"{role}: {str(m.get('content') or '')[:6000]}")
+    head.append("Assistant:")
+    return "\n".join(head)
+
+
+def stream_ollama(payload: dict, model: str, emit) -> None:
+    import json as jsonlib
+    import urllib.request
+
+    msgs = [{"role": "system", "content": build_ask_prompt({**payload, "messages": []})}]
+    for m in payload.get("messages") or []:
+        role = "user" if m.get("role") == "user" else "assistant"
+        msgs.append({"role": role, "content": str(m.get("content") or "")[:6000]})
+    req = urllib.request.Request(
+        OLLAMA_BASE + "/api/chat",
+        data=jsonlib.dumps({"model": model, "messages": msgs, "stream": True}).encode(),
+        headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=ASK_TIMEOUT) as r:
+        for line in r:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = jsonlib.loads(line)
+            except ValueError:
+                continue
+            if obj.get("error"):
+                emit({"error": str(obj["error"])})
+                return
+            chunk = (obj.get("message") or {}).get("content") or ""
+            if chunk:
+                emit({"t": chunk})
+            if obj.get("done"):
+                return
+
+
+def stream_cli(payload: dict, pid: str, emit, stop) -> None:
+    import subprocess
+    import tempfile
+
+    spec = CLI_PROVIDERS[pid]
+    prompt = build_ask_prompt(payload)
+    with tempfile.TemporaryDirectory(prefix="bookify-ask-") as tmp:
+        last = str(Path(tmp) / "last.txt")
+        argv = spec["argv"](prompt, last)
+        try:
+            proc = subprocess.Popen(
+                argv, cwd=tmp, stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                start_new_session=True)   # own process group, so stop kills children
+        except OSError as exc:
+            emit({"error": f"could not start {pid}: {exc}"})
+            return
+        stop["kill"] = lambda: _kill_group(proc)
+        out_chunks: list[bytes] = []
+        try:
+            fd = proc.stdout.fileno()
+            while True:
+                data = os.read(fd, 4096)
+                if not data:
+                    break
+                out_chunks.append(data)
+                if spec["stream"]:
+                    emit({"t": data.decode("utf-8", "replace")})
+            proc.wait(timeout=ASK_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            _kill_group(proc)
+            emit({"error": f"{pid} timed out after {ASK_TIMEOUT}s"})
+            return
+        finally:
+            stop["kill"] = None
+        err = b""
+        try:
+            err = proc.stderr.read() or b""
+        except OSError:
+            pass
+        final = ""
+        try:
+            final = Path(last).read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            pass
+        if not spec["stream"]:
+            body = final or b"".join(out_chunks).decode("utf-8", "replace").strip()
+            if body:
+                emit({"t": body})
+                return
+        elif b"".join(out_chunks).strip():
+            return
+        msg = (err.decode("utf-8", "replace").strip()
+               or f"{pid} produced no output (exit {proc.returncode})")
+        emit({"error": msg[:2000]})
+
+
+def _kill_group(proc) -> None:
+    import signal
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+    except (OSError, ProcessLookupError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+# ----------------------------------------------------------------------------
+# Markdown book
+
+def write_md_book(pages: list[Page], out: Path, title: str) -> None:
+    out.mkdir(parents=True, exist_ok=True)
+    summary = [f"# {title}\n", "## Table of Contents\n"]
+    combined = [f"# {title}\n"]
+    for page in pages:
+        dest = out / page.out_rel_md
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        body = page.md_body
+        if page.kind != "md" or not re.match(r"^#\s", body.lstrip()):
+            body = f"# {page.title}\n\n{body}"
+        dest.write_text(body, encoding="utf-8")
+        indent = "  " * (len(page.rel.parts) - 1)
+        link = str(page.out_rel_md).replace("\\", "/")
+        summary.append(f"{indent}- [{page.title}]({link})")
+        combined.append(f"\n---\n\n<!-- source: {page.rel} -->\n\n{body}\n")
+    (out / "SUMMARY.md").write_text("\n".join(summary) + "\n", encoding="utf-8")
+    (out / "BOOK.md").write_text("\n".join(combined), encoding="utf-8")
+
+
+# ----------------------------------------------------------------------------
+
+def main() -> int:
+    global ASK_TIMEOUT
+    # progress/banner lines should appear as they happen even when the output is
+    # piped or redirected (an agent, `| tee`), not all at once on exit
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, OSError):
+        pass
+    ap = argparse.ArgumentParser(
+        prog="bookify",
+        description="Render a folder's docs as a browsable book (HTML + Markdown).")
+    ap.add_argument("folder", nargs="?", default=".",
+                    help="folder to render (default: current directory)")
+    ap.add_argument("-o", "--out", default=None,
+                    help="output dir (default: ~/.cache/bookify/<name>-<hash>, "
+                         "kept outside the scanned folder)")
+    ap.add_argument("--format", choices=["html", "md", "both"], default="both")
+    ap.add_argument("--title", default=None, help="book title (default: folder name)")
+    ap.add_argument("--include-code", action="store_true",
+                    help="also render source-code files as highlighted pages")
+    ap.add_argument("--serve", nargs="?", const=8123, default=8123, type=int,
+                    metavar="PORT",
+                    help="port to serve the HTML book on (default 8123; serving "
+                         "is on by default)")
+    ap.add_argument("--no-serve", action="store_true",
+                    help="build only, don't start the local server")
+    ap.add_argument("--keep-alive", action="store_true",
+                    help="keep serving even after all browser tabs are closed")
+    ap.add_argument("--ai", nargs="?", const=AI_DEFAULT_MODEL, default=None,
+                    metavar="MODEL",
+                    help="add an AI-generated overview page via local Ollama "
+                         f"(default model: {AI_DEFAULT_MODEL})")
+    ap.add_argument("--ask-model", default=AI_DEFAULT_MODEL, metavar="MODEL",
+                    help="Ollama model to prefer for Ask AI "
+                         f"(default: {AI_DEFAULT_MODEL})")
+    ap.add_argument("--ask-provider", default=None, metavar="ID",
+                    help="force one Ask AI backend (ollama, claude, codex, "
+                         "gemini) instead of auto-detecting")
+    ap.add_argument("--ask-timeout", type=int, default=ASK_TIMEOUT, metavar="SEC",
+                    help=f"per-answer time limit for Ask AI (default {ASK_TIMEOUT})")
+    ap.add_argument("--no-ask", action="store_true",
+                    help="disable the Ask AI sidebar")
+    args = ap.parse_args()
+
+    ASK_TIMEOUT = max(10, args.ask_timeout)
+
+    root = Path(args.folder).expanduser().resolve()
+    if not root.is_dir():
+        print(f"bookify: not a directory: {root}", file=sys.stderr)
+        return 1
+    if args.out:
+        out = Path(args.out).expanduser().resolve()
+    else:
+        tag = hashlib.sha1(str(root).encode()).hexdigest()[:8]
+        out = Path.home() / ".cache" / "bookify" / f"{root.name}-{tag}"
+    title = args.title or root.name
+
+    pages = [p for p in collect_pages(root, args.include_code)
+             if out not in p.src.parents]
+    if not pages:
+        print("bookify: no documentation files found "
+              "(try --include-code to render source files too)", file=sys.stderr)
+        return 1
+
+    html_map, md_map = build_link_maps(pages)
+    for p in pages:
+        render_page(p, html_map, md_map)
+
+    # wipe + rebuild the output, carrying user data (notes, AI cache) across
+    preserved = {}
+    for name in ("annotations.json", "ai-cache.json"):
+        f = out / name
+        if f.exists():
+            preserved[name] = f.read_bytes()
+    if out.exists():
+        shutil.rmtree(out)
+    out.mkdir(parents=True, exist_ok=True)
+    # local-use artifacts: keep git blind to them even if -o points inside a repo
+    (out / ".gitignore").write_text("*\n", encoding="utf-8")
+    for name, data in preserved.items():
+        (out / name).write_bytes(data)
+
+    if args.ai:
+        overview = ai_overview(pages, out, title, args.ai)
+        if overview:
+            pages.insert(0, overview)
+            for p in pages:
+                p.prev = p.next = None
+            for a, b in zip(pages, pages[1:]):
+                a.next, b.prev = b, a
+
+    tree = build_tree(pages)
+    dests = []
+    if args.format in ("html", "both"):
+        write_html_book(pages, tree, out / "html", title)
+        write_map_page(pages, out / "html", title)
+        dests.append(out / "html")
+        print(f"HTML book:     {out / 'html' / 'index.html'}")
+    if args.format in ("md", "both"):
+        write_md_book(pages, out / "markdown", title)
+        dests.append(out / "markdown")
+        print(f"Markdown book: {out / 'markdown' / 'SUMMARY.md'}")
+    # images/diagrams the pages point at, so they aren't broken in the output
+    n_assets = copy_assets(collect_assets(pages, root), *dests) if dests else 0
+    print(f"{len(pages)} pages rendered"
+          + (f", {n_assets} assets copied." if n_assets else "."))
+
+    if not args.no_serve and args.format in ("html", "both"):
+        import functools
+        import http.server
+        import secrets
+        import threading
+        import time
+        import webbrowser
+
+        import json as jsonlib
+
+        state = {"conns": 0}   # open SSE connections == open tabs
+        lock = threading.Lock()
+        seen_any = threading.Event()
+        ann_path = out / "annotations.json"   # preserved across rebuilds
+        ann_lock = threading.Lock()
+        # A random per-run token, handed out by GET /__ask__ (readable only by
+        # same-origin script) and required on POST. Ask AI shells out to local
+        # assistant CLIs, so no other page in the browser gets to trigger it.
+        ask_token = secrets.token_urlsafe(24)
+        ask_state = {"providers": None, "at": 0.0}
+
+        def ask_providers(force: bool = False) -> list:
+            now = time.monotonic()
+            if force or ask_state["providers"] is None or now - ask_state["at"] > 20:
+                provs = detect_providers(args.ask_model)
+                if args.ask_provider:
+                    provs = [p for p in provs if p["id"] == args.ask_provider]
+                ask_state["providers"] = provs
+                ask_state["at"] = now
+            return ask_state["providers"]
+
+        def read_annotations() -> dict:
+            try:
+                db = jsonlib.loads(ann_path.read_bytes())
+                if isinstance(db, dict) and isinstance(db.get("pages"), dict):
+                    return db
+            except (OSError, ValueError):
+                pass
+            return {"version": 1, "pages": {}}
+
+        def save_annotations(payload: dict) -> dict:
+            """Apply one write and return the resulting store.
+
+            `{"merge": {page: [...]}}` touches only the named pages, so two tabs
+            annotating different pages no longer overwrite each other; a whole
+            `{"pages": {...}}` body still replaces the store outright. Written
+            via a temp file + rename so an interrupted write can't truncate the
+            notes that are already saved.
+            """
+            with ann_lock:
+                if isinstance(payload.get("merge"), dict):
+                    db = read_annotations()
+                    for page, items in payload["merge"].items():
+                        if items:
+                            db["pages"][str(page)] = items
+                        else:
+                            db["pages"].pop(str(page), None)
+                elif isinstance(payload.get("pages"), dict):
+                    db = {"version": 1, "pages": payload["pages"]}
+                else:
+                    raise ValueError("expected 'merge' or 'pages'")
+                tmp = ann_path.with_suffix(".json.tmp")
+                tmp.write_text(jsonlib.dumps(db), encoding="utf-8")
+                tmp.replace(ann_path)
+                return db
+
+        class BookHandler(http.server.SimpleHTTPRequestHandler):
+            def do_GET(self):
+                if self.path.startswith("/__annotations__"):
+                    body = jsonlib.dumps(read_annotations()).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                if self.path.startswith("/__ask__"):
+                    provs = [] if args.no_ask else ask_providers()
+                    usable = [p for p in provs if not p.get("unavailable")]
+                    self.send_json({
+                        "ok": bool(usable),
+                        "token": ask_token,
+                        "providers": provs,
+                        "default": (usable[0]["id"] if usable else None),
+                        "reason": ("Ask AI is disabled (--no-ask)" if args.no_ask
+                                   else "" if usable else
+                                   "No local assistant found. Install Ollama "
+                                   f"(ollama pull {AI_DEFAULT_MODEL}) or a CLI "
+                                   "such as claude, codex or gemini."),
+                    })
+                    return
+                if self.path.startswith("/__watch__"):
+                    self.close_connection = True
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    with lock:
+                        state["conns"] += 1
+                    seen_any.set()
+                    try:
+                        # periodic ping so a vanished client (closed tab,
+                        # killed browser) surfaces as a broken pipe
+                        while True:
+                            self.wfile.write(b": ping\n\n")
+                            self.wfile.flush()
+                            time.sleep(5)
+                    except OSError:
+                        pass
+                    finally:
+                        with lock:
+                            state["conns"] -= 1
+                    return
+                super().do_GET()
+
+            def send_json(self, obj, code: int = 200):
+                body = jsonlib.dumps(obj).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self):
+                if self.path.startswith("/__ask__"):
+                    self.do_ask()
+                    return
+                if self.path.startswith("/__annotations__"):
+                    n = int(self.headers.get("Content-Length") or 0)
+                    if n > 2_000_000:
+                        self.send_response(413)
+                        self.end_headers()
+                        return
+                    raw = self.rfile.read(n) if n > 0 else b""
+                    try:
+                        payload = jsonlib.loads(raw or b"{}")
+                        if not isinstance(payload, dict):
+                            raise ValueError("not an object")
+                        body = jsonlib.dumps(save_annotations(payload)).encode()
+                    except ValueError:
+                        self.send_response(400)
+                        self.end_headers()
+                        return
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                self.send_response(404)
+                self.end_headers()
+
+            def do_ask(self):
+                n = int(self.headers.get("Content-Length") or 0)
+                if args.no_ask:
+                    self.send_json({"error": "Ask AI is disabled"}, 403)
+                    return
+                if n <= 0 or n > 1_000_000:
+                    self.send_json({"error": "bad request"}, 400)
+                    return
+                try:
+                    payload = jsonlib.loads(self.rfile.read(n))
+                    if not isinstance(payload, dict):
+                        raise ValueError
+                except ValueError:
+                    self.send_json({"error": "bad json"}, 400)
+                    return
+                if not secrets.compare_digest(str(payload.get("token") or ""), ask_token):
+                    self.send_json({"error": "bad token"}, 403)
+                    return
+                provs = {p["id"]: p for p in ask_providers()}
+                pid = str(payload.get("provider") or "")
+                prov = provs.get(pid)
+                if prov is None or prov.get("unavailable"):
+                    self.send_json({"error": (prov or {}).get("unavailable")
+                                    or f"provider '{pid}' is not available"}, 400)
+                    return
+
+                # stream NDJSON: {"t": ...} chunks, then {"done": true}
+                self.close_connection = True
+                self.send_response(200)
+                self.send_header("Content-Type", "application/x-ndjson")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                stop = {"kill": None}
+
+                def emit(obj):
+                    self.wfile.write((jsonlib.dumps(obj) + "\n").encode())
+                    self.wfile.flush()
+
+                try:
+                    if pid == "ollama":
+                        stream_ollama(payload, prov.get("detail") or args.ask_model, emit)
+                    else:
+                        stream_cli(payload, pid, emit, stop)
+                    emit({"done": True})
+                except OSError:
+                    # reader went away (Stop, closed tab): stop the child too
+                    if stop["kill"]:
+                        stop["kill"]()
+                except Exception as exc:               # noqa: BLE001
+                    try:
+                        emit({"error": f"{type(exc).__name__}: {exc}"[:500]})
+                    except OSError:
+                        pass
+
+            def log_request(self, *a, **kw):
+                if not self.path.startswith(("/__watch__", "/__annotations__",
+                                             "/__ask__")):
+                    super().log_request(*a, **kw)
+
+        handler = functools.partial(BookHandler, directory=str(out / "html"))
+        server = None
+        for port in range(args.serve, args.serve + 20):
+            try:
+                server = http.server.ThreadingHTTPServer(("127.0.0.1", port), handler)
+                break
+            except OSError:
+                continue
+        if server is None:
+            print(f"bookify: no free port in {args.serve}-{args.serve + 19}",
+                  file=sys.stderr)
+            return 1
+        if not args.no_ask:
+            provs = detect_providers(args.ask_model)
+            if args.ask_provider:
+                provs = [p for p in provs if p["id"] == args.ask_provider]
+            usable = [p for p in provs if not p.get("unavailable")]
+            if usable:
+                print("Ask AI:        " + ", ".join(
+                    f"{p['label']} ({p['detail']})" for p in usable)
+                    + f"  — using {usable[0]['label']}")
+            else:
+                print("Ask AI:        no local assistant detected "
+                      f"(ollama pull {AI_DEFAULT_MODEL}, or install claude/codex/gemini)")
+        url = f"http://localhost:{server.server_address[1]}"
+        if args.keep_alive:
+            print(f"Serving at {url} (Ctrl-C to stop)")
+        else:
+            print(f"Serving at {url} — stops automatically when all tabs close "
+                  f"(or Ctrl-C)")
+
+            def watchdog():
+                seen_any.wait()  # don't shut down before the browser ever connects
+                last_alive = time.monotonic()
+                while True:
+                    time.sleep(1)
+                    with lock:
+                        n = state["conns"]
+                    now = time.monotonic()
+                    if n > 0:
+                        last_alive = now
+                    elif now - last_alive > 6:  # grace covers refresh/navigation
+                        print("All tabs closed — stopping server.")
+                        server.shutdown()
+                        return
+
+            threading.Thread(target=watchdog, daemon=True).start()
+        webbrowser.open(url)
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
