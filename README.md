@@ -12,10 +12,12 @@ close the last tab.
 
 ![The rendered book](assets/book.png)
 
-It handles mixed folders: Markdown, plain HTML pages, `.txt`/`.rst`/`.adoc`, and
-optionally source code. Cross-links between formats are rewritten so `.md ↔
-.html` links keep working, and images the pages reference are copied along with
-them.
+It handles mixed folders: Markdown and MDX, reStructuredText, plain HTML pages,
+`.txt`/`.adoc`, and optionally source code — so it reads the sources of
+Docusaurus, MkDocs, Sphinx, Hugo, Jekyll, VitePress and friends as they are (see
+[Docs systems](#docs-systems)). Cross-links between formats are rewritten so
+`.md ↔ .html` links keep working, and images the pages reference are copied
+along with them.
 
 ---
 
@@ -31,6 +33,23 @@ install -m 755 bookify ~/.local/bin/bookify       # anywhere on your PATH
 
 On a network that intercepts TLS, uv needs the system trust store for its first
 dependency fetch: `export UV_NATIVE_TLS=1`.
+
+### Windows
+
+Windows can't run a shebang script directly, so a one-line `.cmd` launcher hands
+it to uv. In PowerShell, from the repository:
+
+```powershell
+winget install --id=astral-sh.uv -e                 # or: scoop install uv
+$bin = "$HOME\.local\bin"; New-Item -ItemType Directory -Force $bin | Out-Null
+Copy-Item bookify $bin
+Set-Content "$bin\bookify.cmd" '@uv run --script --quiet "%~dp0bookify" %*'
+[Environment]::SetEnvironmentVariable('Path', "$bin;" + [Environment]::GetEnvironmentVariable('Path', 'User'), 'User')
+```
+
+Open a new terminal and `bookify` works in PowerShell and cmd. Git Bash runs the
+extensionless script from the same folder by itself, and WSL follows the Linux
+steps above.
 
 ## Usage
 
@@ -52,6 +71,52 @@ bookify <folder> --no-ask             # turn the Ask AI sidebar off
 Output lives outside the folder you scanned (`~/.cache/bookify/` by default), so
 rendered artifacts never pollute a repo. Every output directory also gets a
 `.gitignore` containing `*` as a safety net for custom `-o` paths.
+
+## Docs systems
+
+Point bookify at the folder holding the sources, not the generator's build
+output (which it skips anyway: `_build/`, `_site/`, `build/`, `dist/`).
+
+| Docs system | Sources usually live in | Command |
+|---|---|---|
+| Docusaurus | `docs/` (and `blog/`) | `bookify docs` |
+| MkDocs, Material for MkDocs | `docs/` (`docs_dir` in `mkdocs.yml`) | `bookify docs` |
+| Sphinx | `docs/` or `docs/source/` | `bookify docs` |
+| VitePress | `docs/` | `bookify docs` |
+| Astro Starlight | `src/content/docs/` | `bookify src/content/docs` |
+| Nextra | `pages/` or `content/` | `bookify pages` |
+| Hugo | `content/` | `bookify content` |
+| Jekyll, GitHub Pages | repo root or `docs/` | `bookify docs` |
+| mdBook | `src/` | `bookify src` |
+| GitBook, plain Markdown repo | repo root | `bookify .` |
+| GitHub wiki | the `.wiki` repository | `git clone https://github.com/OWNER/REPO.wiki.git && bookify REPO.wiki` |
+| Obsidian vault, notes folder | the vault | `bookify ~/notes` |
+| Code with its docs | repo root | `bookify . --include-code` |
+
+Every other flag combines as usual, for example
+`bookify docs --title "Acme Docs" --no-serve -o ./book`.
+
+What carries over from the source format:
+
+- **Front matter** (YAML `---` or TOML `+++`) is stripped. `title` names the
+  page, and `sidebar_position`, `nav_order`, `weight`, `order` or `position`
+  orders it within its folder.
+- **Callouts**: `:::tip Title` containers (Docusaurus, VitePress, Starlight),
+  `> [!NOTE]` alerts (GitHub, Obsidian) and `!!! note` admonitions (MkDocs)
+  render as styled boxes. Examples of that syntax inside code fences are left
+  alone.
+- **MDX**: `import`/`export` lines are dropped and the Markdown renders. JSX
+  components pass through as HTML, so their text shows but nothing is
+  interactive.
+- **reStructuredText** renders through docutils, `.. note::` admonitions
+  included. Sphinx-only directives (`toctree`, `autodoc`, …) are left out
+  quietly instead of printing errors into the page.
+- **Links without an extension** (`[setup](./setup)`) resolve to the page.
+
+What does not: generator templating (Jinja, Liquid `{% %}`, Hugo `{{< >}}`
+shortcodes) shows up literally, `[[wikilinks]]` stay plain text, and sidebar
+config (`sidebars.js`, the `mkdocs.yml` nav, mdBook's `SUMMARY.md`) isn't read —
+folders sort alphabetically and pages by front matter, then name.
 
 ## Reading features
 
@@ -177,10 +242,11 @@ CLI on your machine.
 
 ```bash
 ./tests/test_bookify.py                                        # build + server suite
+uv run --script tests/test_bookify.py                          # the same, on Windows
 uv run --with playwright tests/test_bookify.py --browser       # plus the UI suite
 ```
 
-The default suite is stdlib-only and takes about a second. `--browser` drives a
+The default suite is stdlib-only and takes a few seconds. `--browser` drives a
 real browser through the annotation and Ask AI flows; it reuses any chromium
 already in your Playwright cache, or tells you to run `playwright install
 chromium`. Every check corresponds to a bug that was actually found and fixed.

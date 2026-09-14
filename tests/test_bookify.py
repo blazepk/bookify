@@ -37,6 +37,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 BOOKIFY = ROOT / "bookify"
+# Windows can't exec a shebang script, so go through uv explicitly there
+BOOKIFY_CMD = ([str(BOOKIFY)] if os.name != "nt"
+               else ["uv", "run", "--script", "--quiet", str(BOOKIFY)])
 
 PASS: list[str] = []
 FAIL: list[str] = []
@@ -69,7 +72,7 @@ def child_env(extra: dict | None = None) -> dict:
 
 def run_build(src: Path, out: Path, *extra: str) -> subprocess.CompletedProcess:
     return subprocess.run(
-        [str(BOOKIFY), str(src), "--no-serve", "-o", str(out), *extra],
+        [*BOOKIFY_CMD, str(src), "--no-serve", "-o", str(out), *extra],
         capture_output=True, text=True, cwd=ROOT, timeout=600, env=child_env())
 
 
@@ -123,9 +126,11 @@ class Serve:
     def __init__(self, src: Path, out: Path, *extra: str, env: dict | None = None):
         self.port = free_port()
         self.url = f"http://127.0.0.1:{self.port}"
-        full_env = child_env({**(env or {}), "BROWSER": "true"})
+        # a browser command that succeeds and opens nothing
+        no_browser = "true" if os.name != "nt" else "cmd /c rem"
+        full_env = child_env({**(env or {}), "BROWSER": no_browser})
         self.proc = subprocess.Popen(
-            [str(BOOKIFY), str(src), "-o", str(out), "--keep-alive",
+            [*BOOKIFY_CMD, str(src), "-o", str(out), "--keep-alive",
              "--serve", str(self.port), *extra],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
             cwd=ROOT, env=full_env, start_new_session=True)
@@ -145,8 +150,12 @@ class Serve:
     def __exit__(self, *exc) -> None:
         import signal
         try:
-            os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
-        except OSError:
+            if os.name == "nt":   # uv spawns python; /T takes the tree
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(self.proc.pid)],
+                               capture_output=True, check=True)
+            else:
+                os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
+        except (OSError, subprocess.CalledProcessError):
             self.proc.kill()
         try:
             self.proc.wait(timeout=10)
@@ -220,6 +229,20 @@ class FakeOllama:
 
 # ---------------------------------------------------------------- build suite
 
+def broken_links(html: Path) -> list[str]:
+    broken = []
+    for page in html.rglob("*.html"):
+        text = page.read_text(encoding="utf-8", errors="replace")
+        for href in set(part.split('"')[0] for part in text.split('href="')[1:]):
+            target = href.split("#")[0]
+            if not target or target.startswith(
+                    ("http://", "https://", "mailto:", "data:", "/")):
+                continue
+            if not (page.parent / target).exists():
+                broken.append(f"{page.name} -> {href}")
+    return broken
+
+
 def test_build(tmp: Path) -> None:
     print("build")
     src, out = tmp / "src", tmp / "out"
@@ -249,16 +272,7 @@ def test_build(tmp: Path) -> None:
     check("link to .rst retargeted", 'href="README.rst.html"' in readme)
     check("link to .markdown retargeted", 'href="guide/alt.html"' in readme)
 
-    broken = []
-    for page in html.rglob("*.html"):
-        text = page.read_text(errors="replace")
-        for href in set(part.split('"')[0] for part in text.split('href="')[1:]):
-            target = href.split("#")[0]
-            if not target or target.startswith(
-                    ("http://", "https://", "mailto:", "data:", "/")):
-                continue
-            if not (page.parent / target).exists():
-                broken.append(f"{page.name} -> {href}")
+    broken = broken_links(html)
     check("every relative link resolves", not broken, "; ".join(broken[:4]))
 
     # assets a page points at must exist in the output
@@ -284,6 +298,99 @@ def test_build(tmp: Path) -> None:
 
     check("output dir is gitignored",
           (out / ".gitignore").read_text().strip() == "*")
+
+
+def write_docs_systems_fixture(root: Path) -> None:
+    """One source per docs-system dialect bookify is expected to read as-is."""
+    (root / "guide").mkdir(parents=True, exist_ok=True)
+    (root / "_build" / "html").mkdir(parents=True, exist_ok=True)
+    files = {
+        "index.md": "# Home\n\nSee [setup](guide/setup) and [the API](api.rst).\n",
+        # Docusaurus: title and position in front matter, no H1 in the body
+        "guide/zeta.md": '---\ntitle: "Getting Started"\nsidebar_position: 1\n---\n\nMARKER_FM\n',
+        "guide/setup.mdx": (
+            "---\ntitle: Setup\nsidebar_position: 2\n---\n"
+            "import Tabs from '@theme/Tabs';\n"
+            "export const meta = {\n  draft: false,\n};\n\n"
+            "MARKER_MDX\n\n"
+            ":::tip[Pro tip]\nMARKER_TIP\n\n```bash\nnpm run build\n```\n:::\n\n"
+            "> [!WARNING]\n> MARKER_ALERT\n\n"
+            "```md\n:::note\nMARKER_FENCED\n:::\n```\n"),
+        "guide/alpha.md": "# Alpha\n\nMARKER_ALPHA, no front matter.\n",
+        # Hugo: TOML front matter
+        "hugo.md": '+++\ntitle = "Hugo Page"\nweight = 5\n+++\n\nMARKER_TOML\n',
+        # Sphinx: a standard directive plus one plain docutils doesn't know
+        "api.rst": ("API Reference\n=============\n\nMARKER_RST with *emphasis*.\n\n"
+                    ".. note::\n\n   MARKER_RST_NOTE\n\n"
+                    ".. toctree::\n   :maxdepth: 2\n\n   guide/setup\n"),
+        # a generator's build output must not become a second copy of the book
+        "_build/html/stale.md": "# Stale\n\nMARKER_BUILD_OUTPUT\n",
+    }
+    for rel, text in files.items():
+        (root / rel).write_text(text, encoding="utf-8")
+
+
+def test_docs_systems(tmp: Path) -> None:
+    print("docs systems")
+    src, out = tmp / "docsys", tmp / "out-docsys"
+    write_docs_systems_fixture(src)
+    r = run_build(src, out)
+    ok = r.returncode == 0
+    check("docs-system build succeeds", ok, (r.stderr or r.stdout).strip()[-300:])
+    html, md = out / "html", out / "markdown"
+    if not ok or not (html / "guide" / "setup.html").exists():
+        check("docs-system book produced", False, "skipping the checks that depend on it")
+        return
+
+    def main_of(rel: str) -> str:
+        text = (html / rel).read_text(encoding="utf-8")
+        return text.split("<main>", 1)[1].split("</main>", 1)[0]
+
+    zeta_page = (html / "guide" / "zeta.html").read_text(encoding="utf-8")
+    zeta = main_of("guide/zeta.html")
+    check("front matter is not rendered", "sidebar_position" not in zeta and "MARKER_FM" in zeta)
+    check("front-matter title becomes the heading", ">Getting Started</h1>" in zeta, zeta[:200])
+
+    tree = zeta_page.split('<div class="tree">', 1)[1].split("</nav>", 1)[0]
+    at = [tree.find(t) for t in (">Getting Started<", ">Setup<", ">Alpha<")]
+    check("sidebar follows front-matter order", -1 not in at and at == sorted(at), str(at))
+    check("rst title used in the sidebar", ">API Reference<" in tree)
+
+    setup = main_of("guide/setup.html")
+    check("mdx page rendered", "MARKER_MDX" in setup)
+    check("mdx import/export dropped",
+          "import Tabs" not in setup and "export const" not in setup and "draft" not in setup)
+    check(":::tip becomes an admonition",
+          'class="admonition tip"' in setup and "Pro tip" in setup and "MARKER_TIP" in setup)
+    tip = setup.split('class="admonition tip"', 1)[-1].split("MARKER_ALERT", 1)[0]
+    check("fenced code inside a callout still highlights",
+          'class="highlight"' in tip and "```" not in setup)
+    check("GitHub alert becomes an admonition",
+          'class="admonition warning"' in setup and "MARKER_ALERT" in setup
+          and "[!WARNING]" not in setup)
+    check("callout syntax inside a code fence is left alone",
+          "MARKER_FENCED" in setup and setup.count('class="admonition ') == 2)
+
+    check("extensionless link resolves to the page",
+          'href="guide/setup.html"' in main_of("index.html"))
+    hugo = main_of("hugo.html")
+    check("toml front matter read", ">Hugo Page</h1>" in hugo and "weight" not in hugo)
+
+    api = main_of("api.html")
+    check("rst rendered as html", "<em>emphasis</em>" in api and "plaintext" not in api)
+    check("rst directives render", 'class="admonition note"' in api and "MARKER_RST_NOTE" in api)
+    check("unknown sphinx directives stay silent",
+          "toctree" not in api and "System Message" not in api)
+
+    everything = "".join(p.read_text(encoding="utf-8") for p in html.rglob("*.html"))
+    check("generator build output skipped", "MARKER_BUILD_OUTPUT" not in everything)
+    broken = broken_links(html)
+    check("every docs-system link resolves", not broken, "; ".join(broken[:4]))
+
+    setup_md = (md / "guide" / "setup.md").read_text(encoding="utf-8")
+    check("md book drops front matter and mdx imports",
+          setup_md.startswith("# Setup") and "sidebar_position" not in setup_md
+          and "import Tabs" not in setup_md, setup_md[:200])
 
 
 # ---------------------------------------------------------------- server suite
@@ -790,6 +897,7 @@ def main() -> int:
         tmp = Path(td)
         write_fixture(tmp / "src")
         test_build(tmp)
+        test_docs_systems(tmp)
         test_annotations(tmp)
         test_ask(tmp)
         if args.browser:

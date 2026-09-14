@@ -4,13 +4,14 @@
 # dependencies = [
 #   "markdown>=3.5",
 #   "pygments>=2.17",
+#   "docutils>=0.20",
 # ]
 # ///
 """
 bookify — render any folder's docs as a browsable book (HTML + Markdown).
 
-Walks a directory tree, collects documentation files (Markdown, txt, rst,
-adoc — and optionally source code), and generates:
+Walks a directory tree, collects documentation files (Markdown/MDX, rst, HTML,
+txt, adoc — and optionally source code), and generates:
 
   <out>/html/      a static HTML book with a sidebar navigation tree,
                    per-page prev/next links, and syntax highlighting
@@ -49,7 +50,8 @@ from pygments.formatters import HtmlFormatter
 # ----------------------------------------------------------------------------
 # File classification
 
-DOC_EXTS = {".md", ".markdown", ".mdown", ".mkd", ".txt", ".rst", ".adoc", ".asciidoc"}
+DOC_EXTS = {".md", ".mdx", ".markdown", ".mdown", ".mkd", ".txt", ".rst", ".adoc",
+            ".asciidoc"}
 CODE_EXTS = {
     ".py": "python", ".js": "javascript", ".ts": "typescript", ".tsx": "tsx",
     ".jsx": "jsx", ".rs": "rust", ".go": "go", ".java": "java", ".rb": "ruby",
@@ -65,8 +67,10 @@ SKIP_DIRS = {
     "env", ".tox", ".mypy_cache", ".pytest_cache", ".ruff_cache", "dist",
     "build", "target", ".next", ".nuxt", ".cache", "coverage", ".idea",
     ".vscode", "vendor", ".terraform", ".DS_Store", ".bookify",
+    # rendered output of Sphinx and Jekyll, which would duplicate every source page
+    "_build", "_site",
 }
-MD_EXTS = {".md", ".markdown", ".mdown", ".mkd"}
+MD_EXTS = {".md", ".mdx", ".markdown", ".mdown", ".mkd"}
 HTML_EXTS = {".html", ".htm", ".xhtml"}
 # files a doc can point at and expect to still be there in the output
 ASSET_EXTS = {
@@ -87,8 +91,9 @@ class Page:
     src: Path            # absolute source path
     rel: Path            # path relative to the root folder
     title: str = ""
-    kind: str = "md"     # md | text | code
+    kind: str = "md"     # md | rst | html | text | code
     lang: str = ""       # pygments hint for code files
+    order: float = float("inf")  # front-matter position (sidebar_position, weight, ...)
     html_body: str = ""
     md_body: str = ""
     # prev/next are cyclic and link_* are derived: comparing them would make
@@ -133,6 +138,141 @@ def first_heading(text: str) -> str | None:
     return None
 
 
+RST_ADORNMENT = re.compile(r"([=\-~^*#+`:'\"._])\1{2,}")
+
+
+def rst_title(text: str) -> str | None:
+    """The first reStructuredText section title: a line underlined at least as long."""
+    lines = text.splitlines()
+    for line, under in zip(lines, lines[1:]):
+        s, u = line.strip(), under.rstrip()
+        if (s and line[:1] not in (" ", "\t") and not RST_ADORNMENT.fullmatch(s)
+                and RST_ADORNMENT.fullmatch(u) and len(u) >= len(s)):
+            return s
+    return None
+
+
+FRONT_MATTER = re.compile(
+    r"\A﻿?(---|\+\+\+)[ \t]*\r?\n(.*?)\r?\n\1[ \t]*(?:\r?\n|\Z)", re.S)
+FRONT_MATTER_KEY = re.compile(r"^([A-Za-z_][\w-]*)[ \t]*[:=][ \t]*(.*)$")
+# keys docs generators use to place a page in their sidebar, most specific first
+ORDER_KEYS = ("sidebar_position", "nav_order", "weight", "order", "position")
+
+
+def split_front_matter(text: str) -> tuple[dict[str, str], str]:
+    """Separate YAML (`---`) or TOML (`+++`) front matter from the page body.
+
+    Docusaurus, Hugo, Jekyll, VitePress, Astro and MkDocs Material keep page
+    metadata there; left in, it renders as a stray rule over a run-on paragraph.
+    Only top-level scalar keys are read — enough for the title and sidebar
+    order without pulling in a YAML parser.
+    """
+    m = FRONT_MATTER.match(text)
+    if not m:
+        return {}, text
+    meta: dict[str, str] = {}
+    for line in m.group(2).splitlines():
+        km = FRONT_MATTER_KEY.match(line)
+        if not km:
+            continue
+        value = km.group(2).strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        if value and value not in ("|", ">", "|-", ">-"):
+            meta[km.group(1).lower()] = value
+    if not meta:   # a leading horizontal rule, not metadata
+        return {}, text
+    return meta, text[m.end():]
+
+
+def front_matter_order(meta: dict[str, str]) -> float:
+    for key in ORDER_KEYS:
+        try:
+            return float(meta[key])
+        except (KeyError, ValueError):
+            continue
+    return float("inf")
+
+
+FENCE = re.compile(r"^[ \t]*(`{3,}|~{3,})")
+CALLOUT_OPEN = re.compile(
+    r"^[ \t]*:{3,}[ \t]*([A-Za-z][\w-]*)(?:\[([^\]]*)\])?[ \t]*(.*?)[ \t]*$")
+CALLOUT_CLOSE = re.compile(r"^[ \t]*:{3,}[ \t]*$")
+GITHUB_ALERT = re.compile(r"^>[ \t]*\[!([A-Za-z]+)\][ \t]*(.*)$")
+MDX_ESM = re.compile(r"^(?:import|export)\s")
+
+
+def _callout(kind: str, title: str) -> list[str]:
+    # md_in_html (part of "extra") renders the Markdown inside the div, fenced
+    # code included; the classes match what the admonition extension emits
+    kind = kind.lower()
+    label = html_mod.escape(title.strip() or kind.capitalize())
+    return ["", f'<div class="admonition {kind}" markdown="1">',
+            f'<p class="admonition-title">{label}</p>', ""]
+
+
+def _nesting(line: str) -> int:
+    return sum(line.count(c) for c in "{([") - sum(line.count(c) for c in "})]")
+
+
+def normalize_markdown(text: str, mdx: bool = False, callouts: bool = True) -> str:
+    """Rewrite other docs systems' Markdown dialects into what the renderer knows.
+
+    - `:::tip Title` … `:::` containers (Docusaurus, VitePress, Starlight)
+    - `> [!NOTE]` alerts (GitHub, Obsidian)
+    - MDX `import`/`export` statements, which are build-time code, not prose
+    Fenced code blocks pass through untouched, so documented examples of these
+    syntaxes still show up as code.
+    """
+    lines = text.split("\n")
+    out: list[str] = []
+    fence = ""
+    esm_depth = 0
+    open_callouts = 0
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        i += 1
+        if fence:
+            out.append(line)
+            stripped = line.strip()
+            if stripped.startswith(fence) and not stripped.lstrip(fence[0]):
+                fence = ""
+            continue
+        if esm_depth > 0:   # inside a multi-line import/export
+            esm_depth = max(0, esm_depth + _nesting(line))
+            continue
+        m = FENCE.match(line)
+        if m:
+            fence = m.group(1)
+            out.append(line)
+            continue
+        if mdx and MDX_ESM.match(line):
+            esm_depth = max(0, _nesting(line))
+            continue
+        if callouts:
+            m = CALLOUT_OPEN.match(line)
+            if m:
+                out += _callout(m.group(1), m.group(2) or m.group(3))
+                open_callouts += 1
+                continue
+            if open_callouts and CALLOUT_CLOSE.match(line):
+                out += ["", "</div>", ""]
+                open_callouts -= 1
+                continue
+            m = GITHUB_ALERT.match(line)
+            if m:
+                body = [m.group(2)] if m.group(2) else []
+                while i < len(lines) and lines[i].startswith(">"):
+                    body.append(re.sub(r"^>[ \t]?", "", lines[i]))
+                    i += 1
+                out += _callout(m.group(1), "") + body + ["", "</div>", ""]
+                continue
+        out.append(line)
+    out += ["", "</div>"] * open_callouts   # an unclosed container ends with the page
+    return "\n".join(out)
+
+
 def html_title(text: str) -> str | None:
     m = re.search(r"<title[^>]*>(.*?)</title>", text, re.I | re.S) or \
         re.search(r"<h1[^>]*>(.*?)</h1>", text, re.I | re.S)
@@ -147,10 +287,10 @@ def humanize(name: str) -> str:
     return re.sub(r"[-_]+", " ", stem).strip().title() or name
 
 
-def sort_key(p: Path) -> tuple:
-    """README/index first, then case-insensitive alphabetical."""
+def sort_key(p: Path, order: float = float("inf")) -> tuple:
+    """README/index first, then front-matter order, then case-insensitive alphabetical."""
     stem = p.stem.lower()
-    return (0 if stem in ("readme", "index", "home") else 1, str(p).lower())
+    return (0 if stem in ("readme", "index", "home", "_index") else 1, order, str(p).lower())
 
 
 def collect_pages(root: Path, include_code: bool) -> list[Page]:
@@ -166,7 +306,7 @@ def collect_pages(root: Path, include_code: bool) -> list[Page]:
         ext = path.suffix.lower()
         kind = lang = None
         if ext in DOC_EXTS:
-            kind = "md" if ext in MD_EXTS else "text"
+            kind = "md" if ext in MD_EXTS else "rst" if ext == ".rst" else "text"
         elif ext in HTML_EXTS:
             kind = "html"
         elif name.lower() in ("dockerfile", "makefile", "justfile"):
@@ -182,17 +322,24 @@ def collect_pages(root: Path, include_code: bool) -> list[Page]:
         except OSError:
             continue
         rel = path.relative_to(root)
+        order = float("inf")
         if kind == "md":
-            title = first_heading(text) or humanize(name)
+            meta, body = split_front_matter(text)
+            title = meta.get("title") or first_heading(body) or humanize(name)
+            order = front_matter_order(meta)
+        elif kind == "rst":
+            title = rst_title(text) or humanize(name)
         elif kind == "html":
             title = html_title(text) or humanize(name)
         elif kind == "code":
             title = name  # keep exact filename for code pages
         else:
             title = humanize(name)
-        pages.append(Page(src=path, rel=rel, title=title, kind=kind, lang=lang or ""))
+        pages.append(Page(src=path, rel=rel, title=title, kind=kind, lang=lang or "",
+                          order=order))
 
-    pages.sort(key=lambda p: (tuple(str(x).lower() for x in p.rel.parts[:-1]), sort_key(p.rel)))
+    pages.sort(key=lambda p: (tuple(str(x).lower() for x in p.rel.parts[:-1]),
+                              sort_key(p.rel, p.order)))
     assign_out_paths(pages)
     for a, b in zip(pages, pages[1:]):
         a.next, b.prev = b, a
@@ -257,6 +404,15 @@ def _retarget(href: str, page_dir: str, out_dir: str, link_map: dict[str, str],
     # real pages are ever in the map. Extension-based guessing is the fallback.
     key = posixpath.normpath(posixpath.join(page_dir, base))
     out = link_map.get(key)
+    if out is None and not Path(base).suffix:
+        # Docusaurus, VitePress and Hugo link to pages without an extension
+        stem = "" if key == "." else key
+        for cand in (stem + ".md", stem + ".mdx", posixpath.join(stem, "index.md"),
+                     posixpath.join(stem, "README.md"), posixpath.join(stem, "index.mdx"),
+                     posixpath.join(stem, "_index.md")):
+            if cand in link_map:
+                out = link_map[cand]
+                break
     if out is None:
         ext = Path(base).suffix.lower()
         if ext not in DOC_EXTS and ext not in HTML_EXTS:
@@ -375,12 +531,49 @@ def rewrite_links_for_md_book(text: str, page: Page, md_map: dict[str, str]) -> 
     return re.sub(r'(href=")([^"]+)(")', lambda m: m.group(1) + fix(m.group(2)) + m.group(3), text)
 
 
+def render_rst(text: str) -> str | None:
+    """reStructuredText (Sphinx and most Python projects) to HTML via docutils.
+
+    Sphinx-only directives such as toctree or autodoc are unknown to plain
+    docutils; their error reports are silenced so the surrounding prose still
+    renders. Returns None when docutils can't be used, and the caller falls back
+    to preformatted text.
+    """
+    try:
+        import io
+        from docutils.core import publish_parts
+    except ImportError:
+        return None
+    overrides = {
+        "report_level": 5, "halt_level": 5, "warning_stream": io.StringIO(),
+        "traceback": False, "doctitle_xform": False, "syntax_highlight": "none",
+        # a docs folder is no place to read other files or inject raw HTML from
+        "file_insertion_enabled": False, "raw_enabled": False,
+    }
+    try:
+        return publish_parts(text, writer_name="html5", settings_overrides=overrides)["body"]
+    except Exception:   # docutils raises its own hierarchy on malformed input
+        return None
+
+
 def render_page(page: Page, html_map: dict[str, str], md_map: dict[str, str]) -> None:
     text = page.src.read_text(encoding="utf-8", errors="replace")
     if page.kind == "md":
+        meta, body = split_front_matter(text)
+        mdx = page.src.suffix.lower() == ".mdx"
+        source = normalize_markdown(body, mdx=mdx)
+        # generators print the front-matter title themselves when the body has no H1
+        if meta.get("title") and not re.match(r"#\s", source.lstrip()):
+            source = f"# {meta['title']}\n\n{source}"
         MD_RENDERER.reset()
-        page.html_body = rewrite_md_links(MD_RENDERER.convert(text), page, html_map)
-        page.md_body = rewrite_links_for_md_book(text, page, md_map)
+        page.html_body = rewrite_md_links(MD_RENDERER.convert(source), page, html_map)
+        plain = normalize_markdown(body, mdx=True, callouts=False) if mdx else body
+        page.md_body = rewrite_links_for_md_book(plain, page, md_map)
+    elif page.kind == "rst":
+        body = render_rst(text)
+        page.html_body = (rewrite_md_links(body, page, html_map) if body is not None
+                          else f"<pre class='plaintext'>{html_mod.escape(text)}</pre>")
+        page.md_body = f"```rst\n{text}\n```"
     elif page.kind == "html":
         body = extract_html_body(text)
         page.html_body = rewrite_md_links(body, page, html_map)
@@ -490,6 +683,15 @@ main img{{max-width:100%;border-radius:6px}}
 main ul,main ol{{padding-left:1.4rem}}
 main li{{margin:.3rem 0}}
 main hr{{border:0;border-top:1px solid var(--border);margin:2rem 0}}
+main .admonition{{margin:1.2rem 0;padding:.75rem 1rem;background:var(--panel);
+border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:0 8px 8px 0}}
+main .admonition>:last-child{{margin-bottom:0}}
+main .admonition-title{{margin:0 0 .35rem;font-size:.78rem;font-weight:700;
+letter-spacing:.05em;text-transform:uppercase;color:var(--accent)}}
+main .admonition:is(.warning,.caution,.attention){{border-left-color:#C98A1B}}
+main .admonition:is(.warning,.caution,.attention) .admonition-title{{color:#C98A1B}}
+main .admonition:is(.danger,.error,.important){{border-left-color:#C4453C}}
+main .admonition:is(.danger,.error,.important) .admonition-title{{color:#C4453C}}
 main blockquote{{margin:1.2rem 0;padding:.15rem 0 .15rem 1.1rem;
 border-left:3px solid var(--accent);color:var(--muted);font-style:italic}}
 main table{{border-collapse:collapse;font-family:var(--sans);font-size:.9rem;
@@ -1725,6 +1927,8 @@ def stream_cli(payload: dict, pid: str, emit, stop) -> None:
     with tempfile.TemporaryDirectory(prefix="bookify-ask-") as tmp:
         last = str(Path(tmp) / "last.txt")
         argv = spec["argv"](prompt, last)
+        # Windows CreateProcess only appends .exe; resolve .cmd/.bat shims too
+        argv[0] = shutil.which(argv[0]) or argv[0]
         try:
             proc = subprocess.Popen(
                 argv, cwd=tmp, stdin=subprocess.DEVNULL,
@@ -1775,9 +1979,14 @@ def stream_cli(payload: dict, pid: str, emit, stop) -> None:
 
 def _kill_group(proc) -> None:
     import signal
+    import subprocess
     try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-    except (OSError, ProcessLookupError):
+        if os.name == "nt":   # no process groups: taskkill /T takes the whole tree
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           capture_output=True, check=True)
+        else:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+    except (OSError, ProcessLookupError, subprocess.CalledProcessError):
         try:
             proc.kill()
         except OSError:
