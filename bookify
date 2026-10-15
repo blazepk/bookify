@@ -5,6 +5,8 @@
 #   "markdown>=3.5",
 #   "pygments>=2.17",
 #   "docutils>=0.20",
+#   "pymdown-extensions>=10.0",
+#   "pyyaml>=6.0",
 # ]
 # ///
 """
@@ -70,6 +72,8 @@ SKIP_DIRS = {
     # rendered output of Sphinx and Jekyll, which would duplicate every source page
     "_build", "_site",
 }
+# a Jekyll site's templates, partials and data, which are not pages of their own
+JEKYLL_INTERNALS = {"_layouts", "_includes", "_sass", "_data", "_plugins"}
 MD_EXTS = {".md", ".mdx", ".markdown", ".mdown", ".mkd"}
 HTML_EXTS = {".html", ".htm", ".xhtml"}
 # files a doc can point at and expect to still be there in the output
@@ -79,10 +83,25 @@ ASSET_EXTS = {
     ".woff", ".woff2", ".ttf", ".otf", ".csv", ".tsv", ".zip",
 }
 MAX_ASSET_BYTES = 25 * 1024 * 1024
+# past this many pages the sidebar ships once in nav.js instead of inside every page,
+# which would otherwise grow the book with the square of its size
+NAV_INLINE_LIMIT = int(os.environ.get("BOOKIFY_INLINE_NAV_LIMIT", "400"))
 
+# "extra" minus fenced_code, which superfences replaces so code blocks also work
+# inside admonitions, tabs and list items; the pymdownx set covers GitHub-style
+# task lists, strikethrough and bare links plus Material for MkDocs' tabs and
+# collapsible admonitions
 MD_RENDERER = md_lib.Markdown(
-    extensions=["extra", "toc", "sane_lists", "codehilite", "admonition"],
-    extension_configs={"codehilite": {"guess_lang": False, "css_class": "highlight"}},
+    extensions=["abbr", "attr_list", "def_list", "footnotes", "md_in_html", "tables",
+                "toc", "sane_lists", "admonition", "pymdownx.highlight",
+                "pymdownx.superfences", "pymdownx.details", "pymdownx.tabbed",
+                "pymdownx.tasklist", "pymdownx.tilde", "pymdownx.mark",
+                "pymdownx.magiclink"],
+    extension_configs={
+        "pymdownx.highlight": {"css_class": "highlight", "guess_lang": False},
+        "pymdownx.tabbed": {"alternate_style": True},
+        "pymdownx.tilde": {"subscript": False},
+    },
 )
 
 
@@ -94,6 +113,8 @@ class Page:
     kind: str = "md"     # md | rst | html | text | code
     lang: str = ""       # pygments hint for code files
     order: float = float("inf")  # front-matter position (sidebar_position, weight, ...)
+    section: tuple = ()  # sidebar section labels, outermost first
+    meta: dict = field(default_factory=dict, repr=False, compare=False)  # front matter
     html_body: str = ""
     md_body: str = ""
     # prev/next are cyclic and link_* are derived: comparing them would make
@@ -195,27 +216,56 @@ def front_matter_order(meta: dict[str, str]) -> float:
 
 
 FENCE = re.compile(r"^[ \t]*(`{3,}|~{3,})")
+FENCE_INFO = re.compile(r"^([ \t]*)(`{3,}|~{3,})[ \t]*([^\s`{]*)(.*)$")
 CALLOUT_OPEN = re.compile(
     r"^[ \t]*:{3,}[ \t]*([A-Za-z][\w-]*)(?:\[([^\]]*)\])?[ \t]*(.*?)[ \t]*$")
 CALLOUT_CLOSE = re.compile(r"^[ \t]*:{3,}[ \t]*$")
-GITHUB_ALERT = re.compile(r"^>[ \t]*\[!([A-Za-z]+)\][ \t]*(.*)$")
+# > [!NOTE] (GitHub), > [!tip]- Title (Obsidian: +/- make it foldable, open or closed)
+GITHUB_ALERT = re.compile(r"^>[ \t]*\[!([A-Za-z][\w-]*)\]([+-]?)[ \t]*(.*)$")
+DETAILS_OPEN = re.compile(r"^\s*<details(\s[^>]*)?>\s*$", re.I)
+FULL_EMBED = re.compile(r"^\s*!\[\[([^\[\]\n]+?)\]\]\s*$")
 MDX_ESM = re.compile(r"^(?:import|export)\s")
 
 
-def _callout(kind: str, title: str) -> list[str]:
+_INLINE_MD: "md_lib.Markdown | None" = None
+
+
+def inline_html(text: str) -> str:
+    """One line of inline Markdown as HTML, without the paragraph around it —
+    for titles that sit inside raw HTML, where Markdown isn't processed."""
+    global _INLINE_MD
+    if _INLINE_MD is None:
+        _INLINE_MD = md_lib.Markdown(extensions=["pymdownx.tilde", "pymdownx.mark"],
+                                     extension_configs={"pymdownx.tilde": {"subscript": False}})
+    _INLINE_MD.reset()
+    return re.sub(r"^<p>(.*)</p>$", r"\1", _INLINE_MD.convert(text.strip()), flags=re.S)
+
+
+def _label(kind: str, title_html: str) -> str:
+    return title_html.strip() or html_mod.escape(kind.capitalize())
+
+
+def _callout(kind: str, title_html: str) -> list[str]:
     # md_in_html (part of "extra") renders the Markdown inside the div, fenced
     # code included; the classes match what the admonition extension emits
     kind = kind.lower()
-    label = html_mod.escape(title.strip() or kind.capitalize())
     return ["", f'<div class="admonition {kind}" markdown="1">',
-            f'<p class="admonition-title">{label}</p>', ""]
+            f'<p class="admonition-title">{_label(kind, title_html)}</p>', ""]
+
+
+def _foldable(kind: str, title_html: str, open_: bool) -> list[str]:
+    kind = kind.lower()
+    label = _label(kind, title_html)
+    return ["", f'<details class="admonition {kind}"{" open" if open_ else ""} markdown="1">',
+            f"<summary>{label}</summary>", ""]
 
 
 def _nesting(line: str) -> int:
     return sum(line.count(c) for c in "{([") - sum(line.count(c) for c in "})]")
 
 
-def normalize_markdown(text: str, mdx: bool = False, callouts: bool = True) -> str:
+def normalize_markdown(text: str, mdx: bool = False, callouts: bool = True,
+                       links: "WikiLinks | None" = None, page: "Page | None" = None) -> str:
     """Rewrite other docs systems' Markdown dialects into what the renderer knows.
 
     - `:::tip Title` … `:::` containers (Docusaurus, VitePress, Starlight)
@@ -229,6 +279,15 @@ def normalize_markdown(text: str, mdx: bool = False, callouts: bool = True) -> s
     fence = ""
     esm_depth = 0
     open_callouts = 0
+    transclusions = 0
+    base = posixpath.dirname(page.rel.as_posix()) if page else ""
+
+    def wl(s: str) -> str:
+        return links.inline(s, base) if links and "[[" in s else s
+
+    def title(s: str) -> str:
+        return inline_html(wl(s)) if s and s.strip() else ""
+
     i = 0
     while i < len(lines):
         line = lines[i]
@@ -242,18 +301,33 @@ def normalize_markdown(text: str, mdx: bool = False, callouts: bool = True) -> s
         if esm_depth > 0:   # inside a multi-line import/export
             esm_depth = max(0, esm_depth + _nesting(line))
             continue
-        m = FENCE.match(line)
+        m = FENCE_INFO.match(line)
         if m:
-            fence = m.group(1)
-            out.append(line)
+            indent, fence, lang, info = m.groups()
+            named = re.search(r"""title=["']([^"']+)["']""", info)
+            if named and callouts:   # Docusaurus, Starlight and Material name code blocks
+                out += ["", f'{indent}<p class="code-title">{html_mod.escape(named.group(1))}</p>']
+            # keep only the language: line ranges and flags ({1,3}, showLineNumbers, ins={2})
+            # aren't understood and would stop the fence from being recognised at all
+            out.append(f"{indent}{fence}{lang}" if callouts else line)
             continue
         if mdx and MDX_ESM.match(line):
             esm_depth = max(0, _nesting(line))
             continue
+        if callouts and DETAILS_OPEN.match(line) and "markdown=" not in line:
+            # a raw <details> block would otherwise print its Markdown unrendered
+            line = re.sub(r"<details", '<details markdown="1"', line, count=1, flags=re.I)
+        if callouts and links and transclusions < 25:
+            em = FULL_EMBED.match(line)
+            inserted = links.transclude(em.group(1), base, page) if em else None
+            if inserted is not None:   # ![[Note#Section]] on its own line shows that note
+                transclusions += 1
+                lines[i:i] = inserted
+                continue
         if callouts:
             m = CALLOUT_OPEN.match(line)
             if m:
-                out += _callout(m.group(1), m.group(2) or m.group(3))
+                out += _callout(m.group(1), title(m.group(2) or m.group(3)))
                 open_callouts += 1
                 continue
             if open_callouts and CALLOUT_CLOSE.match(line):
@@ -262,13 +336,17 @@ def normalize_markdown(text: str, mdx: bool = False, callouts: bool = True) -> s
                 continue
             m = GITHUB_ALERT.match(line)
             if m:
-                body = [m.group(2)] if m.group(2) else []
+                kind, fold, label = m.group(1), m.group(2), title(m.group(3))
+                body = []
                 while i < len(lines) and lines[i].startswith(">"):
-                    body.append(re.sub(r"^>[ \t]?", "", lines[i]))
+                    body.append(wl(re.sub(r"^>[ \t]?", "", lines[i])))
                     i += 1
-                out += _callout(m.group(1), "") + body + ["", "</div>", ""]
+                if fold:
+                    out += _foldable(kind, label, fold == "+") + body + ["", "</details>", ""]
+                else:
+                    out += _callout(kind, label) + body + ["", "</div>", ""]
                 continue
-        out.append(line)
+        out.append(wl(line))
     out += ["", "</div>"] * open_callouts   # an unclosed container ends with the page
     return "\n".join(out)
 
@@ -282,23 +360,46 @@ def html_title(text: str) -> str | None:
     return None
 
 
-def humanize(name: str) -> str:
-    stem = Path(name).stem
-    return re.sub(r"[-_]+", " ", stem).strip().title() or name
+NUMBER_PREFIX = re.compile(r"^(\d+)[-_. ]+(?=\S)")
+
+
+def humanize(name: str, is_dir: bool = False) -> str:
+    stem = name if is_dir else Path(name).stem
+    # Docusaurus-style "01-intro" is ordered by the number and labelled by the rest
+    stem = NUMBER_PREFIX.sub("", stem) or stem
+    words = re.sub(r"[-_]+", " ", stem).split()
+    # capitalise without lowercasing the rest, so "API" and "iOS" survive
+    return " ".join(w[:1].upper() + w[1:] for w in words) or name
+
+
+def fallback_title(rel: Path) -> str:
+    """A name for a page without a title of its own; index pages take their folder's."""
+    if rel.stem.lower() in ("index", "readme", "_index"):
+        return humanize(rel.parent.name, is_dir=True) if rel.parent.parts else "Home"
+    return humanize(rel.name)
+
+
+def natural(s: str) -> tuple:
+    """Case-insensitive, with digit runs compared as numbers: page2 before page10."""
+    return tuple(int(t) if t.isdigit() else t for t in re.split(r"(\d+)", s.lower()))
 
 
 def sort_key(p: Path, order: float = float("inf")) -> tuple:
     """README/index first, then front-matter order, then case-insensitive alphabetical."""
     stem = p.stem.lower()
-    return (0 if stem in ("readme", "index", "home", "_index") else 1, order, str(p).lower())
+    return (0 if stem in ("readme", "index", "home", "_index") else 1, order,
+            natural(p.as_posix()))
 
 
 def collect_pages(root: Path, include_code: bool) -> list[Page]:
     pages: list[Page] = []
+    skip = SKIP_DIRS | (JEKYLL_INTERNALS if (root / "_config.yml").is_file() else set())
+    if (root / ".vitepress").is_dir():
+        skip = skip | {"public"}   # VitePress copies public/ verbatim; it holds no pages
     for path in sorted(root.rglob("*")):
         if not path.is_file():
             continue
-        if any(part in SKIP_DIRS or part.startswith(".") for part in path.relative_to(root).parts[:-1]):
+        if any(part in skip or part.startswith(".") for part in path.relative_to(root).parts[:-1]):
             continue
         name = path.name
         if name.startswith(".") and name.lower() != ".env.example":
@@ -323,20 +424,22 @@ def collect_pages(root: Path, include_code: bool) -> list[Page]:
             continue
         rel = path.relative_to(root)
         order = float("inf")
+        meta: dict[str, str] = {}
         if kind == "md":
             meta, body = split_front_matter(text)
-            title = meta.get("title") or first_heading(body) or humanize(name)
+            title = meta.get("title") or first_heading(body) or fallback_title(rel)
             order = front_matter_order(meta)
         elif kind == "rst":
-            title = rst_title(text) or humanize(name)
+            title = rst_title(text) or fallback_title(rel)
         elif kind == "html":
-            title = html_title(text) or humanize(name)
+            meta, body = split_front_matter(text)
+            title = meta.get("title") or html_title(body) or fallback_title(rel)
         elif kind == "code":
             title = name  # keep exact filename for code pages
         else:
             title = humanize(name)
         pages.append(Page(src=path, rel=rel, title=title, kind=kind, lang=lang or "",
-                          order=order))
+                          order=order, meta=meta))
 
     pages.sort(key=lambda p: (tuple(str(x).lower() for x in p.rel.parts[:-1]),
                               sort_key(p.rel, p.order)))
@@ -373,6 +476,788 @@ def assign_out_paths(pages: list[Page]) -> None:
                 n += 1
             taken.add(cand)
             setattr(p, attr, cand)
+
+
+# ----------------------------------------------------------------------------
+# Navigation: reading order and sidebar sections
+
+def load_yaml(text: str):
+    """YAML that tolerates tags it doesn't know (MkDocs' !!python/name, !ENV, ...)."""
+    import yaml
+
+    class Loader(yaml.SafeLoader):
+        pass
+
+    Loader.add_multi_constructor("", lambda loader, suffix, node: None)
+    return yaml.load(text, Loader=Loader)
+
+
+def _as_order(value) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float("inf")
+
+
+def dir_meta(root: Path, rel_dir: Path) -> tuple[float, str]:
+    """(order, label) for a folder, from the metadata docs systems keep beside it.
+
+    Docusaurus: _category_.json / _category_.yml (position, label).
+    Hugo: the section's _index.md front matter (weight, linkTitle or title).
+    Otherwise a number prefix ("02-guides") orders it and its name labels it.
+    """
+    import json as jsonlib
+
+    folder = root / rel_dir
+    order, label = float("inf"), ""
+    for name in ("_category_.json", "_category_.yml", "_category_.yaml"):
+        f = folder / name
+        if not f.is_file():
+            continue
+        try:
+            text = f.read_text(encoding="utf-8", errors="replace")
+            data = jsonlib.loads(text) if name.endswith(".json") else load_yaml(text)
+        except Exception:   # a malformed category file shouldn't sink the build
+            data = None
+        if isinstance(data, dict):
+            label = str(data.get("label") or "")
+            order = _as_order(data.get("position"))
+        break
+    index = folder / "_index.md"
+    if index.is_file():
+        meta, _ = split_front_matter(index.read_text(encoding="utf-8", errors="replace"))
+        label = label or meta.get("linktitle") or meta.get("title") or ""
+        if order == float("inf"):
+            order = front_matter_order(meta)
+    m = NUMBER_PREFIX.match(rel_dir.name)
+    if order == float("inf") and m:
+        order = float(m.group(1))
+    return order, label or humanize(rel_dir.name, is_dir=True)
+
+
+def arrange_by_folders(pages: list[Page], root: Path) -> None:
+    """The default reading order: folders and pages sorted the way docs systems do."""
+    metas: dict[Path, tuple[float, str]] = {}
+
+    def folders(p: Page) -> list[Path]:
+        return [Path(*p.rel.parts[:i]) for i in range(1, len(p.rel.parts))]
+
+    def meta(d: Path) -> tuple[float, str]:
+        if d not in metas:
+            metas[d] = dir_meta(root, d)
+        return metas[d]
+
+    for p in pages:
+        p.section = tuple(meta(d)[1] for d in folders(p))
+    pages.sort(key=lambda p: (tuple((meta(d)[0], natural(d.name)) for d in folders(p)),
+                              sort_key(p.rel, p.order)))
+
+
+def link_pages(pages: list[Page]) -> None:
+    for p in pages:
+        p.prev = p.next = None
+    for a, b in zip(pages, pages[1:]):
+        a.next, b.prev = b, a
+
+
+@dataclass
+class NavItem:
+    """One entry in a docs system's own navigation config."""
+    title: str = ""
+    target: str = ""              # how the config names the page: path, doc id, slug, URL
+    children: list = field(default_factory=list)
+    expand: "str | None" = None   # a folder whose pages are listed in folder order
+
+
+URL_SCHEME = re.compile(r"^[a-z][a-z0-9+.-]*:", re.I)
+
+
+class PageIndex:
+    """Finds a page however a nav config or a link names it.
+
+    Configs point at pages by source path (MkDocs, mdBook), path without an
+    extension (Sphinx docnames, VitePress links), Docusaurus doc id, Starlight
+    slug, or published URL (Jekyll permalinks, Docusaurus slugs).
+    """
+
+    def __init__(self, pages: list[Page]):
+        self.pages = pages
+        self.exact: dict[str, Page] = {}
+        self.alias: dict[str, Page] = {}
+        self.by_stem: dict[str, list[Page]] = {}
+        for p in pages:
+            self.exact.setdefault(p.rel.as_posix().lower(), p)
+        for p in pages:
+            for name in self._aliases(p):
+                self.alias.setdefault(self.norm(name), p)
+            self.by_stem.setdefault(p.rel.stem.lower(), []).append(p)
+
+    @staticmethod
+    def norm(name: str) -> str:
+        name = unquote(name.split("#", 1)[0].split("?", 1)[0]).strip().strip("/")
+        low = name.lower()
+        for ext in (".html", ".htm", ".mdx", ".md", ".markdown", ".rst"):
+            if low.endswith(ext):
+                name = name[: -len(ext)]
+                break
+        parts = name.split("/")
+        if len(parts) > 1 and parts[-1].lower() in ("index", "readme", "_index"):
+            parts = parts[:-1]
+        elif parts[-1].lower() in ("index", "readme", "_index"):
+            parts = [""]
+        return "/".join(parts).lower()
+
+    @staticmethod
+    def _aliases(p: Page) -> list[str]:
+        no_ext = posixpath.splitext(p.rel.as_posix())[0]
+        segs = no_ext.split("/")
+        stripped = "/".join(NUMBER_PREFIX.sub("", s) or s for s in segs)
+        names = [no_ext, stripped]
+        if segs[0].startswith("_") and len(segs) > 1:   # a Jekyll collection: _docs/x -> docs/x
+            names.append("/".join([segs[0][1:], *segs[1:]]))
+        if p.meta.get("id"):                             # Docusaurus doc id replaces the file name
+            names.append(posixpath.join(posixpath.dirname(stripped), p.meta["id"]))
+        names += [p.meta[k] for k in ("slug", "permalink", "url") if p.meta.get(k)]
+        return names
+
+    def find(self, target: str, base: str = "") -> "Page | None":
+        if not target or URL_SCHEME.match(target):
+            return None
+        raw = unquote(target.split("#", 1)[0].split("?", 1)[0]).strip()
+        if not raw:
+            return None
+        tries = []
+        if base and not raw.startswith("/"):
+            tries.append(posixpath.normpath(posixpath.join(base, raw)))
+        tries.append(posixpath.normpath(raw.lstrip("/") or "."))
+        for t in tries:
+            if t.lower() in self.exact:
+                return self.exact[t.lower()]
+        for t in tries:
+            hit = self.alias.get(self.norm(t))
+            if hit:
+                return hit
+        return None
+
+
+def apply_outline(pages: list[Page], items: list[NavItem], index: PageIndex) -> int:
+    """Order and section pages by a nav config. Pages it doesn't mention keep
+    their folder order after the listed ones. Returns how many pages it placed."""
+    placed: dict[int, tuple] = {}
+
+    def place(p: Page, section: tuple, title: str) -> None:
+        if id(p) not in placed:
+            placed[id(p)] = (len(placed), section, title)
+
+    def walk(entries: list[NavItem], section: tuple) -> None:
+        for it in entries:
+            if it.expand is not None:
+                prefix = it.expand.strip("/")
+                depth = len(prefix.split("/")) if prefix else 0
+                inner = section + ((it.title,) if it.title else ())
+                for p in pages:
+                    if not prefix or p.rel.as_posix().startswith(prefix + "/"):
+                        place(p, inner + p.section[depth:], "")
+                continue
+            page = index.find(it.target) if it.target else None
+            if it.children:
+                label = it.title or (page.title if page else "")
+                inner = section + (label,) if label else section
+                if page:   # the label names the section; the page keeps its own heading
+                    place(page, inner, "")
+                walk(it.children, inner)
+            elif page:
+                place(page, section, it.title)
+
+    walk(items, ())
+    listed = sorted((p for p in pages if id(p) in placed), key=lambda p: placed[id(p)][0])
+    for p in listed:
+        _, p.section, title = placed[id(p)]
+        if title:
+            p.title = title
+    rest = [p for p in pages if id(p) not in placed]
+    # a config listing pages from a single folder (VitePress's en/) serves that folder
+    # as the site root, so pages it leaves out don't sit under it either
+    tops = {p.rel.parts[0] for p in listed if len(p.rel.parts) > 1}
+    if len(tops) == 1 and all(len(p.rel.parts) > 1 for p in listed):
+        top = next(iter(tops))
+        for p in rest:
+            if len(p.rel.parts) > 1 and p.rel.parts[0] == top and p.section:
+                p.section = p.section[1:]
+    # a home page the sidebar leaves out (Starlight, Jekyll, VitePress's en/) still opens the book
+    home = sorted((p for p in rest if len(p.rel.parts) <= 2
+                   and p.rel.stem.lower() in ("index", "readme")),
+                  key=lambda p: len(p.rel.parts))[:1]
+    for h in home:
+        h.section = ()
+        if h.title == fallback_title(h.rel):   # "En" for VitePress's en/index.md says nothing
+            h.title = "Home"
+    pages[:] = home + listed + [p for p in rest if all(p is not h for h in home)]
+    return len(listed)
+
+
+JS_TOKEN = re.compile(r"""
+    (?P<ws>\s+|//[^\n]*|/\*.*?\*/)
+  | (?P<str>'(?:\\.|[^'\\\n])*'|"(?:\\.|[^"\\\n])*"|`(?:\\.|[^`\\])*`)
+  | (?P<num>\d+(?:\.\d+)?)
+  | (?P<spread>\.\.\.)
+  | (?P<name>[A-Za-z_$][\w$]*)
+  | (?P<punct>[{}\[\]():,=;<>])
+  | (?P<other>.)
+""", re.S | re.X)
+
+
+class JSLiteral:
+    """Reads the object and array literals of a JS/TS config file without running it.
+
+    Values it can't know statically (variables, calls, spreads) come back as None,
+    so a sidebar that is mostly literal still comes through.
+    """
+
+    def __init__(self, text: str):
+        self.toks = [(m.lastgroup, m.group()) for m in JS_TOKEN.finditer(text)
+                     if m.lastgroup != "ws"]
+        self.i = 0
+        self._calling: set[str] = set()
+
+    def _returned(self, name: str):
+        """What `function name() { return <literal> }` in the same file returns."""
+        if name in self._calling:
+            return None
+        for j in range(len(self.toks) - 1):
+            if self.toks[j] == ("name", "function") and self.toks[j + 1][1] == name:
+                for r in range(j + 2, len(self.toks)):
+                    if self.toks[r] == ("name", "return"):
+                        saved, self.i = self.i, r + 1
+                        self._calling.add(name)
+                        try:
+                            return self.value()
+                        finally:
+                            self._calling.discard(name)
+                            self.i = saved
+                return None
+        return None
+
+    def _peek(self, ahead: int = 0) -> tuple[str, str]:
+        j = self.i + ahead
+        return self.toks[j] if j < len(self.toks) else ("", "")
+
+    @staticmethod
+    def _unquote(tok: str) -> str:
+        return re.sub(r"\\(.)", lambda m: {"n": "\n", "t": "\t"}.get(m.group(1), m.group(1)),
+                      tok[1:-1])
+
+    def _skip(self) -> None:
+        """Past one expression, stopping before the `,` or bracket that ends it."""
+        depth = 0
+        while self.i < len(self.toks):
+            kind, v = self.toks[self.i]
+            if kind == "punct" and v in "([{":
+                depth += 1
+            elif kind == "punct" and v in ")]}":
+                if depth == 0:
+                    return
+                depth -= 1
+            elif kind == "punct" and v == "," and depth == 0:
+                return
+            self.i += 1
+
+    def value(self):
+        kind, v = self._peek()
+        if v == "{" and kind == "punct":
+            return self._object()
+        if v == "[" and kind == "punct":
+            return self._array()
+        if kind == "str":
+            self.i += 1
+            return self._unquote(v)
+        if kind == "num" and self._peek(1)[1] in (",", "}", "]", ""):
+            self.i += 1
+            return float(v) if "." in v else int(v)
+        if kind == "name" and v in ("true", "false", "null", "undefined") \
+                and self._peek(1)[1] in (",", "}", "]", ""):
+            self.i += 1
+            return {"true": True, "false": False}.get(v)
+        if kind == "name" and self._peek(1)[1] == "(":   # a helper such as sidebarGuide()
+            result = self._returned(v)
+            if result is not None:
+                self._skip()
+                return result
+        self._skip()
+        return None
+
+    def _object(self) -> dict:
+        self.i += 1
+        out: dict = {}
+        while self.i < len(self.toks):
+            kind, v = self._peek()
+            if kind == "punct" and v == "}":
+                self.i += 1
+                return out
+            if kind == "punct" and v == ",":
+                self.i += 1
+            elif kind == "spread":
+                self.i += 1
+                self._skip()
+            elif kind in ("str", "name", "num"):
+                key = self._unquote(v) if kind == "str" else v
+                self.i += 1
+                if self._peek()[1] == ":":
+                    self.i += 1
+                    out[key] = self.value()
+                elif self._peek()[1] in (",", "}"):
+                    out[key] = None   # shorthand property: a variable
+                else:
+                    self._skip()      # method, getter, anything else
+            else:
+                self._skip()
+                if self._peek()[1] not in (",", "}"):
+                    self.i += 1
+        return out
+
+    def _array(self) -> list:
+        self.i += 1
+        out: list = []
+        while self.i < len(self.toks):
+            kind, v = self._peek()
+            if kind == "punct" and v == "]":
+                self.i += 1
+                return out
+            if kind == "punct" and v == ",":
+                self.i += 1
+            elif kind == "spread":
+                self.i += 1
+                self._skip()
+            else:
+                start = self.i
+                out.append(self.value())
+                if self.i == start:
+                    self.i += 1
+        return out
+
+    def lookup(self, name: str):
+        """The first literal given to `name`, as a key (`name: ...`) or a binding
+        (`name = ...`, `name: Type = ...`)."""
+        for j, (kind, v) in enumerate(self.toks):
+            if v != name or kind not in ("name", "str"):
+                continue
+            after = [t[1] for t in self.toks[j + 1:j + 4]] + ["", "", ""]
+            if after[0] == ":" and self.toks[j + 2][0] == "name" and after[2] == "=":
+                self.i = j + 4                         # TypeScript annotation
+            elif after[0] == ":" or (after[0] == "=" and after[1] not in ("=", ">")):
+                self.i = j + 2
+            else:
+                continue
+            found = self.value()
+            if found is not None:
+                return found
+        return None
+
+    def assigned_object(self, want) -> "dict | None":
+        """The first `= {...}` or `export default {...}` object that satisfies `want`."""
+        for j, (kind, v) in enumerate(self.toks):
+            if kind != "punct" or v != "{" or j == 0:
+                continue
+            prev, prev2 = self.toks[j - 1][1], self.toks[j - 2][1] if j > 1 else ""
+            if prev == "=" or (prev == "default" and prev2 == "export"):
+                self.i = j
+                found = self._object()
+                if want(found):
+                    return found
+        return None
+
+
+def _docusaurus_items(entries, prefix: str) -> list[NavItem]:
+    items: list[NavItem] = []
+    for e in entries or []:
+        if isinstance(e, str):
+            items.append(NavItem(target=prefix + e))
+        elif isinstance(e, dict):
+            kind = e.get("type")
+            if kind in ("doc", "ref") and e.get("id"):
+                items.append(NavItem(title=str(e.get("label") or ""), target=prefix + str(e["id"])))
+            elif kind == "category" or (kind is None and isinstance(e.get("items"), list)):
+                link = e.get("link") if isinstance(e.get("link"), dict) else {}
+                target = prefix + str(link["id"]) if link.get("type") == "doc" and link.get("id") else ""
+                items.append(NavItem(title=str(e.get("label") or ""), target=target,
+                                     children=_docusaurus_items(e.get("items"), prefix)))
+            elif kind == "autogenerated":
+                items.append(NavItem(expand=prefix + str(e.get("dirName") or "").strip("./")))
+            elif kind is None:   # shorthand category: {"Label": [items]}
+                for label, value in e.items():
+                    if isinstance(value, list):
+                        items.append(NavItem(title=str(label),
+                                             children=_docusaurus_items(value, prefix)))
+    return items
+
+
+def nav_docusaurus(root: Path, index: PageIndex):
+    """Docusaurus: sidebars.ts/js/json beside the site's docusaurus.config."""
+    import json as jsonlib
+
+    def is_site(d: Path) -> bool:
+        return any((d / f"docusaurus.config.{e}").is_file() for e in ("ts", "js", "mjs", "cjs"))
+
+    for folder, prefix in ((root.parent, ""), (root, "docs/")):
+        if not (is_site(folder) or (prefix == "" and root.name == "docs")):
+            continue
+        for name in ("sidebars.ts", "sidebars.js", "sidebars.mjs", "sidebars.cjs", "sidebars.json"):
+            f = folder / name
+            if not f.is_file():
+                continue
+            text = f.read_text(encoding="utf-8", errors="replace")
+            data = jsonlib.loads(text) if name.endswith(".json") else JSLiteral(text).assigned_object(
+                lambda o: isinstance(o, dict) and any(isinstance(v, (list, dict)) for v in o.values()))
+            if not isinstance(data, dict):
+                return None
+            items: list[NavItem] = []
+            for value in data.values():   # every sidebar, in file order
+                items += _docusaurus_items(value if isinstance(value, list) else [value], prefix)
+            return (items, name) if items else None
+    return None
+
+
+def _locale_dirs(root: Path, prefix: str, locales) -> list[str]:
+    """Folders holding translations, which would repeat every page in another language."""
+    if not isinstance(locales, dict):
+        return []
+    return [prefix + k + "/" for k in locales if k != "root" and (root / prefix / k).is_dir()]
+
+
+def _starlight_items(entries, prefix: str) -> list[NavItem]:
+    items: list[NavItem] = []
+    for e in entries or []:
+        if isinstance(e, str):
+            items.append(NavItem(target=prefix + e))
+        elif isinstance(e, dict):
+            label = str(e.get("label") or "")
+            if isinstance(e.get("autogenerate"), dict):
+                directory = str(e["autogenerate"].get("directory") or "").strip("/")
+                items.append(NavItem(title=label, expand=prefix + directory))
+            elif isinstance(e.get("items"), list):
+                items.append(NavItem(title=label, children=_starlight_items(e["items"], prefix)))
+            elif isinstance(e.get("slug") or e.get("link"), str):
+                target = e.get("slug") or e.get("link")
+                if not URL_SCHEME.match(target):
+                    items.append(NavItem(title=label, target=prefix + target.strip("/")))
+    return items
+
+
+def nav_starlight(root: Path, index: PageIndex):
+    """Astro Starlight: the sidebar in astro.config, for pages in src/content/docs."""
+    if [p.lower() for p in root.parts[-3:]] == ["src", "content", "docs"]:
+        site, prefix = root.parents[2], ""
+    elif (root / "src" / "content" / "docs").is_dir():
+        site, prefix = root, "src/content/docs/"
+    else:
+        return None
+    cfg = next((site / f"astro.config.{e}" for e in ("mjs", "ts", "js", "mts")
+                if (site / f"astro.config.{e}").is_file()), None)
+    if cfg is None:
+        return None
+    parser = JSLiteral(cfg.read_text(encoding="utf-8", errors="replace"))
+    sidebar = parser.lookup("sidebar")
+    if not isinstance(sidebar, list):
+        return None
+    drop = _locale_dirs(root, prefix, parser.lookup("locales"))
+    return _starlight_items(sidebar, prefix), f"{cfg.name} sidebar", drop
+
+
+def nav_mkdocs(root: Path, index: PageIndex):
+    """MkDocs: the `nav` in mkdocs.yml, whose paths are relative to docs_dir."""
+    for folder in (root, root.parent):
+        for name in ("mkdocs.yml", "mkdocs.yaml"):
+            cfg = folder / name
+            if not cfg.is_file():
+                continue
+            data = load_yaml(cfg.read_text(encoding="utf-8", errors="replace"))
+            if not isinstance(data, dict):
+                return None
+            docs = (folder / str(data.get("docs_dir") or "docs")).resolve()
+            if docs == root:
+                prefix = ""
+            elif root in docs.parents:
+                prefix = docs.relative_to(root).as_posix() + "/"
+            else:
+                continue
+            if not isinstance(data.get("nav"), list):
+                return None   # without a nav, MkDocs itself orders by folder
+            return _mkdocs_items(data["nav"], prefix), f"{name} nav"
+    return None
+
+
+def _mkdocs_items(entries: list, prefix: str) -> list[NavItem]:
+    items = []
+    for e in entries:
+        if isinstance(e, str):
+            items.append(NavItem(target=prefix + e))
+        elif isinstance(e, dict):
+            for title, value in e.items():
+                if isinstance(value, str) and not URL_SCHEME.match(value):
+                    items.append(NavItem(title=str(title), target=prefix + value))
+                elif isinstance(value, list):
+                    items.append(NavItem(title=str(title), children=_mkdocs_items(value, prefix)))
+    return items
+
+
+SUMMARY_LINK = re.compile(r"^(\s*)(?:[-*+]\s+)?\[(.*?)\]\((.*?)\)\s*$")
+
+
+def nav_summary(root: Path, index: PageIndex):
+    """mdBook and GitBook: SUMMARY.md, a nested list of links under part headings."""
+    f = root / "SUMMARY.md"
+    if not f.is_file():
+        return None
+    items: list[NavItem] = []
+    part = items
+    stack: list[tuple[int, NavItem]] = []
+    linked = False
+    for line in f.read_text(encoding="utf-8", errors="replace").splitlines():
+        h = re.match(r"^#{1,6}\s+(.*)", line)
+        if h:
+            label = h.group(1).strip()
+            if not items and label.lower() in ("summary", "table of contents", "contents"):
+                continue   # the file's own title
+            sec = NavItem(title=label)
+            items.append(sec)
+            part, stack = sec.children, []
+            continue
+        m = SUMMARY_LINK.match(line)
+        if not m or not m.group(3).strip():   # not a link, or an mdBook draft chapter
+            continue
+        linked = True
+        indent = len(m.group(1).expandtabs(4))
+        item = NavItem(title=m.group(2).strip(), target=m.group(3).strip())
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        (stack[-1][1].children if stack else part).append(item)
+        stack.append((indent, item))
+    return (items, "SUMMARY.md") if linked else None
+
+
+def _parse_toctrees(text: str, markdown: bool) -> list[tuple[str, list[tuple[str, str]], bool, str]]:
+    """Each toctree in a Sphinx document: (caption, [(title, docname)], glob, heading above)."""
+    lines = text.splitlines()
+    blocks = []
+    heading = ""
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        nxt = lines[i + 1] if i + 1 < len(lines) else ""
+        if markdown:
+            h = re.match(r"^#{1,6}\s+(.*)", line)
+            if h:
+                heading = h.group(1).strip()
+            opener = re.match(r"^(`{3,}|:{3,})\{toctree\}", line.strip())
+        else:
+            s = line.strip()
+            if (s and not line[:1].isspace() and not RST_ADORNMENT.fullmatch(s)
+                    and RST_ADORNMENT.fullmatch(nxt.rstrip()) and len(nxt.rstrip()) >= len(s)):
+                heading = s
+            opener = re.match(r"^\s*\.\.\s+toctree::", line)
+        i += 1
+        if not opener:
+            continue
+        fence = opener.group(1) if markdown else ""
+        caption, glob, entries = "", False, []
+        while i < len(lines):
+            raw, s = lines[i], lines[i].strip()
+            if markdown and s.startswith(fence) and not s.lstrip(fence[0]):
+                i += 1
+                break
+            if not markdown and s and not raw[:1].isspace():
+                break
+            i += 1
+            if not s or s == "---":
+                continue
+            opt = re.match(r"^:?(\w+):\s*(.*)$", s) if s.startswith(":") or (markdown and re.match(r"^\w+:\s", s)) else None
+            if opt:
+                if opt.group(1) == "caption":
+                    caption = opt.group(2).strip()
+                elif opt.group(1) == "glob":
+                    glob = True
+                continue
+            em = re.match(r"^(.*?)\s*<([^>]+)>$", s)
+            entries.append((em.group(1).strip(), em.group(2).strip()) if em else ("", s))
+        blocks.append((caption, entries, glob, heading))
+    return blocks
+
+
+def _toctree_items(page: Page, index: PageIndex, prefix: str, seen: set, top: bool) -> list[NavItem]:
+    import fnmatch
+
+    text = page.src.read_text(encoding="utf-8", errors="replace")
+    docdir = posixpath.dirname(page.rel.as_posix())
+    out: list[NavItem] = []
+    for caption, entries, glob, heading in _parse_toctrees(text, page.kind == "md"):
+        group: list[NavItem] = []
+        for title, name in entries:
+            if name == "self" or URL_SCHEME.match(name):
+                continue
+            target = (prefix + name.lstrip("/")) if name.startswith("/") \
+                else posixpath.normpath(posixpath.join(docdir, name))
+            if glob and any(c in name for c in "*?["):
+                found = sorted((p for p in index.pages
+                                if fnmatch.fnmatch(posixpath.splitext(p.rel.as_posix())[0], target)),
+                               key=lambda p: natural(p.rel.as_posix()))
+            else:
+                found = [index.find(target)]
+            for child in found:
+                if child is None or id(child) in seen:
+                    continue
+                seen.add(id(child))
+                group.append(NavItem(title=title, target=child.rel.as_posix(),
+                                     children=_toctree_items(child, index, prefix, seen, False)))
+        # the root document's toctrees group the sidebar; untitled ones borrow the heading above
+        label = caption or (heading if top else "")
+        if label and group:
+            out.append(NavItem(title=label, children=group))
+        else:
+            out.extend(group)
+    return out
+
+
+def nav_sphinx(root: Path, index: PageIndex):
+    """Sphinx: the toctree hierarchy, starting from root_doc in conf.py."""
+    for base in ("", "source/"):
+        conf = root / base / "conf.py"
+        if conf.is_file():
+            break
+    else:
+        return None
+    m = re.search(r"^(?:root_doc|master_doc)\s*=\s*['\"]([^'\"]+)['\"]",
+                  conf.read_text(encoding="utf-8", errors="replace"), re.M)
+    start = index.find(base + (m.group(1) if m else "index"))
+    if start is None:
+        return None
+    seen = {id(start)}
+    items = [NavItem(target=start.rel.as_posix())] + _toctree_items(start, index, base, seen, True)
+    return (items, "Sphinx toctree") if len(items) > 1 else None
+
+
+def nav_jekyll(root: Path, index: PageIndex):
+    """Jekyll: a navigation data file (_data/docs_nav.yml and friends) listing permalinks."""
+    site = next((d for d in (root, root.parent) if (d / "_config.yml").is_file()), None)
+    if site is None:
+        return None
+    for name in ("docs_nav.yml", "navigation.yml", "nav.yml", "sidebar.yml", "toc.yml"):
+        f = site / "_data" / name
+        if f.is_file():
+            items = _data_nav_items(load_yaml(f.read_text(encoding="utf-8", errors="replace")))
+            return (items, f"_data/{name}") if items else None
+    return None
+
+
+def _data_nav_items(data) -> list[NavItem]:
+    items: list[NavItem] = []
+    if not isinstance(data, list):
+        return items
+    for e in data:
+        if isinstance(e, str):
+            items.append(NavItem(target=e))
+        elif isinstance(e, dict):
+            kids = next((v for k, v in e.items() if isinstance(v, list) and k in
+                         ("docs", "children", "items", "links", "pages", "subfolderitems")), None)
+            items.append(NavItem(
+                title=str(e.get("title") or e.get("text") or e.get("label") or ""),
+                target=str(e.get("link") or e.get("url") or e.get("page") or e.get("path") or ""),
+                children=_data_nav_items(kids) if kids else []))
+    return items
+
+
+def _vitepress_items(entries, base: str) -> list[NavItem]:
+    items: list[NavItem] = []
+    for e in entries or []:
+        if not isinstance(e, dict):
+            continue
+        here = e["base"] if isinstance(e.get("base"), str) else base
+        link = e.get("link")
+        target = ""
+        if isinstance(link, str) and not URL_SCHEME.match(link):
+            target = link if link.startswith("/") else here + link
+        items.append(NavItem(title=str(e.get("text") or ""), target=target,
+                             children=_vitepress_items(e.get("items"), here)))
+    return items
+
+
+def nav_vitepress(root: Path, index: PageIndex):
+    """VitePress: themeConfig.sidebar, as one list or per-path groups, honouring
+    `base` prefixes, `rewrites` (such as en/ served at /) and locale folders."""
+    configs = [root / ".vitepress" / f"config.{e}" for e in ("ts", "mts", "js", "mjs")]
+    main_cfg = next((c for c in configs if c.is_file()), None)
+    if main_cfg is None:
+        return None
+    main = JSLiteral(main_cfg.read_text(encoding="utf-8", errors="replace"))
+    candidates = [main_cfg] + [root / ".vitepress" / "config" / f"{n}.{e}"
+                               for n in ("index", "en", "shared") for e in ("ts", "mts", "js", "mjs")] \
+        + [root / f"config.{e}" for e in ("ts", "mts", "js", "mjs")] \
+        + [root / "en" / f"config.{e}" for e in ("ts", "mts", "js", "mjs")]
+    sidebar, used = None, main_cfg
+    for c in candidates:
+        if c.is_file():
+            found = (main if c == main_cfg else
+                     JSLiteral(c.read_text(encoding="utf-8", errors="replace"))).lookup("sidebar")
+            if isinstance(found, (list, dict)):
+                sidebar, used = found, c
+                break
+    if sidebar is None:
+        return None
+    groups = [sidebar] if isinstance(sidebar, list) else list(sidebar.values())
+    items: list[NavItem] = []
+    for g in groups:
+        if isinstance(g, list):
+            items += _vitepress_items(g, "/")
+        elif isinstance(g, dict):
+            items += _vitepress_items(g.get("items"), g["base"] if isinstance(g.get("base"), str) else "/")
+
+    # rewrites map source paths to URLs ('en/:rest*': ':rest*'); links name URLs
+    rewrites = main.lookup("rewrites")
+    pairs = [(k.split(":", 1)[0], v.split(":", 1)[0]) for k, v in (rewrites or {}).items()
+             if isinstance(v, str) and ":" in k and ":" in v]
+
+    def retarget(entries: list[NavItem]) -> None:
+        for it in entries:
+            url = it.target.lstrip("/")
+            if url and index.find(url) is None:
+                for source, served in pairs:
+                    if url.startswith(served) and index.find(source + url[len(served):]):
+                        it.target = source + url[len(served):]
+                        break
+            retarget(it.children)
+
+    retarget(items)
+    rel = used.relative_to(root).as_posix()
+    return items, f"{rel} sidebar", _locale_dirs(root, "", main.lookup("locales"))
+
+
+NAV_SOURCES = [nav_mkdocs, nav_summary, nav_sphinx, nav_jekyll, nav_docusaurus, nav_starlight,
+               nav_vitepress]
+
+
+def arrange(pages: list[Page], root: Path) -> str:
+    """Put pages in reading order and sections. Returns where the order came from."""
+    arrange_by_folders(pages, root)
+    index = PageIndex(pages)
+    for source in NAV_SOURCES:
+        try:
+            found = source(root, index)
+        except Exception as exc:   # a config bookify can't read falls back to folders
+            print(f"bookify: ignoring navigation from {source.__name__[4:]}: {exc}",
+                  file=sys.stderr)
+            continue
+        if not found:
+            continue
+        items, label, *extra = found
+        drop = tuple(extra[0]) if extra and extra[0] else ()
+        if drop:   # translations of the same pages
+            pages[:] = [p for p in pages if not p.rel.as_posix().startswith(drop)]
+            index = PageIndex(pages)
+        placed = apply_outline(pages, items, index)
+        if placed:
+            if label == "SUMMARY.md":   # it's the table of contents, not a chapter
+                pages[:] = [p for p in pages if p.rel.as_posix().lower() != "summary.md"]
+            return f"{label} ({placed} of {len(pages)} pages listed)"
+    return "folders"
 
 
 # ----------------------------------------------------------------------------
@@ -531,6 +1416,659 @@ def rewrite_links_for_md_book(text: str, page: Page, md_map: dict[str, str]) -> 
     return re.sub(r'(href=")([^"]+)(")', lambda m: m.group(1) + fix(m.group(2)) + m.group(3), text)
 
 
+WIKILINK = re.compile(r"(!?)\[\[([^\[\]\n]+?)\]\]")
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".avif", ".bmp"}
+
+
+def _md_text(s: str) -> str:
+    return s.replace("[", r"\[").replace("]", r"\]")
+
+
+class WikiLinks:
+    """Obsidian-style [[wikilinks]] and ![[embeds]], rewritten as ordinary Markdown.
+
+    A name resolves the way Obsidian does: a path if it has one, otherwise any page
+    or attachment with that file name, preferring the one nearest the linking page.
+    """
+
+    def __init__(self, pages: list[Page], root: Path):
+        self.root = root
+        self.index = PageIndex(pages)
+        self.files: dict[str, list[str]] = {}
+        for path in root.rglob("*"):
+            if path.suffix.lower() not in ASSET_EXTS or not path.is_file():
+                continue
+            rel = path.relative_to(root)
+            if any(part in SKIP_DIRS or part.startswith(".") for part in rel.parts[:-1]):
+                continue
+            self.files.setdefault(path.name.lower(), []).append(rel.as_posix())
+
+    @staticmethod
+    def _nearest(options: list[str], base: str) -> str:
+        return min(options, key=lambda o: (len(posixpath.relpath(o, base or ".").split("/")), o))
+
+    def resolve(self, name: str, base: str) -> tuple["Page | None", "str | None"]:
+        name = name.strip()
+        if not name:
+            return None, None
+        if Path(name).suffix.lower() in ASSET_EXTS:
+            for cand in (posixpath.normpath(posixpath.join(base, name)), posixpath.normpath(name)):
+                if (self.root / cand).is_file():
+                    return None, cand
+            hits = self.files.get(Path(name).name.lower())
+            return None, self._nearest(hits, base) if hits else None
+        page = self.index.find(name, base)
+        if page is None:
+            last = name.rsplit("/", 1)[-1]
+            key = (Path(last).stem if Path(last).suffix.lower() in DOC_EXTS else last).lower()
+            hits = self.index.by_stem.get(key, [])
+            if hits:
+                page = min(hits, key=lambda p: (len(posixpath.relpath(p.rel.as_posix(),
+                                                                      base or ".").split("/")),
+                                                p.rel.as_posix()))
+        return page, None
+
+    def link(self, raw: str, display: str, base: str) -> str:
+        from markdown.extensions.toc import slugify
+
+        name, _, anchor = raw.partition("#")
+        heading = anchor.split("#")[-1].strip()
+        if heading.startswith("^"):   # block references have no anchor outside Obsidian
+            heading = ""
+        if not name.strip():          # [[#Heading]] on the same page
+            text = display or heading
+            return f"[{_md_text(text)}](#{slugify(heading, '-')})" if heading else text
+        page, file = self.resolve(name, base)
+        dest = page.rel.as_posix() if page else file
+        text = display or (f"{name.strip()} > {heading}" if heading else name.strip())
+        if not dest:
+            return (f'<span class="wikilink missing" title="No page named '
+                    f'{html_mod.escape(name.strip())}">{html_mod.escape(text)}</span>')
+        href = posixpath.relpath(dest, base or ".")
+        if heading and page:
+            href += "#" + slugify(heading, "-")
+        return f"[{_md_text(text)}](<{href}>)"
+
+    def embed(self, raw: str, base: str) -> str:
+        target, _, size = raw.partition("|")
+        name = target.partition("#")[0]
+        page, file = self.resolve(name, base)
+        if file is None:
+            return self.link(target, "", base)
+        href = posixpath.relpath(file, base or ".")
+        if Path(file).suffix.lower() not in IMAGE_EXTS:
+            return f"[{_md_text(Path(file).name)}](<{href}>)"
+        m = re.fullmatch(r"\s*(\d+)(?:x(\d+))?\s*", size)
+        attrs = ""
+        if m:
+            attrs = f'{{ width="{m.group(1)}"' + (f' height="{m.group(2)}"' if m.group(2) else "") + " }"
+        return f"![{_md_text(Path(file).stem)}](<{href}>){attrs}"
+
+    def inline(self, line: str, base: str) -> str:
+        """Rewrite every wikilink on a line, leaving inline code alone."""
+        def one(m: re.Match) -> str:
+            # inside a table Obsidian escapes the alias pipe as \|
+            raw = m.group(2).replace("\\|", "|")
+            if m.group(1):
+                return self.embed(raw, base)
+            name, _, display = raw.partition("|")
+            return self.link(name, display, base)
+
+        # a wikilink that starts inside inline code is an example; inline code inside
+        # a wikilink's alias is just formatting
+        spans = [m.span() for m in re.finditer(r"`+[^`]*`+", line)]
+        return WIKILINK.sub(
+            lambda m: m.group(0) if any(a <= m.start() < b for a, b in spans) else one(m), line)
+
+    def transclude(self, raw: str, base: str, current: "Page | None") -> "list[str] | None":
+        """The lines of an embedded note, or one of its sections, framed with a link back."""
+        from markdown.extensions.toc import slugify
+
+        target = raw.partition("|")[0]
+        name, _, anchor = target.partition("#")
+        page, _ = self.resolve(name, base)
+        if page is None or page is current or page.kind != "md":
+            return None
+        _, body = split_front_matter(page.src.read_text(encoding="utf-8", errors="replace"))
+        lines = body.split("\n")
+        heading = anchor.split("#")[-1].strip()
+        if heading and not heading.startswith("^"):
+            start = level = None
+            for n, line in enumerate(lines):
+                h = re.match(r"^(#{1,6})\s+(.*?)\s*#*\s*$", line)
+                if not h:
+                    continue
+                if start is None and slugify(h.group(2), "-") == slugify(heading, "-"):
+                    start, level = n + 1, len(h.group(1))
+                elif start is not None and len(h.group(1)) <= level:
+                    lines = lines[start:n]
+                    break
+            else:
+                if start is None:
+                    return None
+                lines = lines[start:]
+        else:
+            heading = ""
+        href = posixpath.relpath(page.rel.as_posix(), base or ".")
+        if heading:
+            href += "#" + slugify(heading, "-")
+        label = page.title + (f" › {heading}" if heading else "")
+        return ["", '<div class="embed" markdown="1">',
+                f'<p class="embed-source"><a href="{html_mod.escape(href)}">{html_mod.escape(label)}</a></p>',
+                "", *lines, "", "</div>", ""]
+
+
+# ----------------------------------------------------------------------------
+# Generator markup that isn't Markdown: Hugo shortcodes, MDX components, includes
+
+SHORTCODE_ESCAPED = re.compile(r"\{\{([<%])/\*\s*(.*?)\s*\*/([>%])\}\}")
+SHORTCODE = re.compile(r"\{\{([<%])-?\s*(/?)\s*([\w.-]+)(.*?)\s*-?[>%]\}\}")
+LITERAL_BRACES = ""   # stands in for "{{" of an escaped shortcode until the end
+CALLOUT_SC = {"note", "tip", "warning", "caution", "danger", "important", "info", "hint",
+              "notice", "alert", "callout", "admonition", "attention", "error"}
+GENERIC_CALLOUT_SC = {"hint", "notice", "alert", "callout", "admonition"}
+DETAILS_SC = {"details", "expand", "collapse", "spoiler", "accordion"}
+TABSET_SC = {"tabs", "tabpane", "tabgroup", "code-tabs"}
+TAB_SC = {"tab", "tabitem"}
+CODE_SC = {"highlight", "code", "code-toggle", "code-block", "codeblock"}
+MDX_OPEN = re.compile(r"^\s*<([A-Z][\w.]*)(\s[^>]*?)?\s*(/?)>\s*$", re.S)
+MDX_CLOSE = re.compile(r"^\s*</([A-Z][\w.]*)\s*>\s*$")
+MDX_ATTR = re.compile(r"""([\w-]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|\{\s*["'`]?([^}"'`]*)["'`]?\s*\}))?""")
+MDX_COMMENT = re.compile(r"\{/\*.*?\*/\}", re.S)
+MDX_INLINE = re.compile(
+    r"""<([A-Z][\w.]*)((?:\s+[\w-]+(?:\s*=\s*(?:"[^"]*"|'[^']*'|\{[^}]*\}))?)*)\s*/>""")
+MDX_CALLOUT = {"Admonition", "Aside", "Callout", "Note", "Tip", "Info", "Warning", "Caution", "Danger"}
+LIQUID_TOKEN = re.compile(r"\{%-?\s*(\w+)(.*?)-?%\}|\{\{(?![<%])-?(.*?)-?\}\}", re.S)
+LIQUID_HIGHLIGHT = re.compile(r"^(\s*)\{%-?\s*highlight\s+([\w+#-]*)[^%]*-?%\}\s*$")
+LIQUID_ENDHIGHLIGHT = re.compile(r"^\s*\{%-?\s*endhighlight\s*-?%\}\s*$")
+LIQUID_INCLUDE = re.compile(
+    r"""^\s*\{%-?\s*(include|include_relative)\s+(["']?)([^\s"'%]+)\2[^%]*-?%\}\s*$""")
+SNIPPET_LINE = re.compile(r"""^(\s*)(;?)-+8<-+\s+(["'])([^"']+)\3\s*$""")
+SNIPPET_BLOCK = re.compile(r"^\s*-+8<-+\s*$")
+
+
+def _dig(data, keys: list[str]):
+    for k in keys:
+        if not isinstance(data, dict):
+            return None
+        data = data.get(k)
+    return data
+
+
+def _yaml_file(path: Path) -> dict:
+    try:
+        data = load_yaml(path.read_text(encoding="utf-8", errors="replace"))
+    except Exception:   # an unreadable config just means no variables
+        return {}
+    return data if isinstance(data, dict) else {}
+MDX_LABEL = {"TabItem", "Tab", "Card"}
+
+
+def _sc_args(s: str) -> tuple[list[str], dict[str, str]]:
+    """Positional and key="value" arguments of a shortcode."""
+    import shlex
+
+    s = s.strip()
+    s = s[:-1].strip() if s.endswith("/") else s
+    try:
+        tokens = shlex.split(s)
+    except ValueError:
+        tokens = s.split()
+    pos, kw = [], {}
+    for t in tokens:
+        k, eq, v = t.partition("=")
+        if eq and re.fullmatch(r"[\w-]+", k):
+            kw[k.lower()] = v
+        else:
+            pos.append(t)
+    return pos, kw
+
+
+def _jsx_attrs(s: "str | None") -> dict[str, str]:
+    return {m.group(1).lower(): next((g for g in m.group(2, 3, 4) if g is not None), "true")
+            for m in MDX_ATTR.finditer(s or "")}
+
+
+class Templates:
+    """Rewrites docs-generator markup into Markdown and HTML the renderer knows."""
+
+    MAX_INSERTS = 100
+
+    def __init__(self, root: Path, index: PageIndex):
+        self.root = root
+        self.index = index
+        self.include_dirs: list[Path] = []
+        self.snippet_dirs: list[Path] = []
+        self.liquid = ""            # "jekyll" or "jinja" when the site's pages are templates
+        self.site: dict = {}        # site.* (Jekyll _config.yml) or config.* (mkdocs.yml)
+        self.variables: dict = {}   # names mkdocs-macros exposes directly: the `extra` block
+        self._raw = self._comment = False
+
+        jekyll = next((d for d in (root, root.parent) if (d / "_config.yml").is_file()), None)
+        if jekyll:
+            self.liquid = "jekyll"
+            self.site = _yaml_file(jekyll / "_config.yml")
+            self.include_dirs.append(jekyll / "_includes")
+        cfg_path = next((d / n for d in (root, root.parent) for n in ("mkdocs.yml", "mkdocs.yaml")
+                         if (d / n).is_file()), None)
+        if cfg_path:
+            cfg = _yaml_file(cfg_path)
+            for plugin in cfg.get("plugins") or []:
+                name, opts = (plugin, {}) if isinstance(plugin, str) else next(iter(plugin.items()), ("", {}))
+                if name == "macros":
+                    self.liquid = self.liquid or "jinja"
+                    self.site = cfg
+                    self.variables = cfg.get("extra") if isinstance(cfg.get("extra"), dict) else {}
+                    if isinstance(opts, dict) and opts.get("include_dir"):
+                        self.include_dirs.append(cfg_path.parent / str(opts["include_dir"]))
+            for ext in cfg.get("markdown_extensions") or []:
+                name, opts = (ext, {}) if isinstance(ext, str) else next(iter(ext.items()), ("", {}))
+                if name == "pymdownx.snippets":
+                    paths = (opts or {}).get("base_path", ".") if isinstance(opts, dict) else "."
+                    for p in (paths if isinstance(paths, list) else [paths]):
+                        self.snippet_dirs.append(cfg_path.parent / str(p))
+
+    def _read(self, candidates: list[Path], allowed: list[Path]) -> "list[str] | None":
+        roots = []
+        for a in allowed:
+            try:
+                roots.append(a.resolve())
+            except OSError:
+                continue
+        for c in candidates:
+            try:
+                path = c.resolve()
+                if path.is_file() and any(path == r or r in path.parents for r in roots):
+                    _, body = split_front_matter(path.read_text(encoding="utf-8", errors="replace"))
+                    return body.split("\n")
+            except OSError:
+                continue
+        return None
+
+    def url(self, value: str, base: str) -> str:
+        """A site URL (/docs/x/, or docs/x/ given to relative_url) as a link relative
+        to the page when the book has that page or file; otherwise as given."""
+        if URL_SCHEME.match(value) or value.startswith(("#", "//")):
+            return value
+        path, _, anchor = value.partition("#")
+        page = self.index.find("/" + path.lstrip("/"))
+        if page is not None:
+            return posixpath.relpath(page.rel.as_posix(), base or ".") + ("#" + anchor if anchor else "")
+        if path.strip("/") and (self.root / path.lstrip("/")).is_file():
+            return posixpath.relpath(path.lstrip("/"), base or ".")
+        return value
+
+    def _expr(self, expr: str, base: str, meta: dict) -> str:
+        head, *filters = [p.strip() for p in expr.split("|")]
+        literal = re.fullmatch(r"""(['"])(.*)\1""", head)
+        if literal:
+            value = literal.group(2)
+        else:
+            parts = head.split(".")
+            if parts[0] == "page":
+                rest = parts[1:2] if parts[1:2] != ["meta"] else parts[2:3]
+                value = meta.get(rest[0].lower()) if rest else None
+            elif parts[0] in ("site", "config"):
+                value = _dig(self.site, parts[1:])
+            else:
+                value = _dig(self.variables, parts)
+        if value is None or isinstance(value, (dict, list)):
+            return ""
+        value = str(value)
+        for f in filters:
+            name, _, arg = f.partition(":")
+            name, arg = name.strip(), arg.strip()
+            if name in ("relative_url", "absolute_url", "url"):
+                value = self.url(value, base)
+            elif name in ("prepend", "append"):
+                lit = re.fullmatch(r"""(['"])(.*)\1""", arg)
+                extra = lit.group(2) if lit else ""   # site.baseurl and friends have no meaning here
+                value = extra + value if name == "prepend" else value + extra
+            elif name in ("upcase", "upper"):
+                value = value.upper()
+            elif name in ("downcase", "lower"):
+                value = value.lower()
+        return html_mod.escape(value, quote=False)
+
+    def _liquid(self, line: str, base: str, meta: dict) -> "str | None":
+        """Liquid/Jinja on one line, carrying raw and comment blocks across lines.
+        None means the whole line sat inside a comment."""
+        out: list[str] = []
+        pos = 0
+        for m in LIQUID_TOKEN.finditer(line):
+            text, pos = line[pos:m.start()], m.end()
+            tag = (m.group(1) or "").lower()
+            if self._raw:
+                out.append(text + ("" if tag == "endraw" else m.group(0)))
+                self._raw = tag != "endraw"
+                continue
+            if self._comment:
+                self._comment = tag != "endcomment"
+                continue
+            out.append(text)
+            if tag == "raw":
+                self._raw = True
+            elif tag == "comment":
+                self._comment = True
+            elif tag in ("link", "post_url"):
+                target = m.group(2).strip().strip("'\"")
+                if tag == "post_url":
+                    hits = self.index.by_stem.get(target.lower(), [])
+                    out.append(posixpath.relpath(hits[0].rel.as_posix(), base or ".") if hits else target)
+                else:
+                    out.append(self.link_to(target, base))
+            elif not tag:
+                out.append(self._expr(m.group(3), base, meta))
+            # control flow, assignments and captures render nothing by themselves
+        if self._comment:
+            return "".join(out) if out and "".join(out).strip() else None
+        out.append(line[pos:])
+        return "".join(out)
+
+    def _liquid_include(self, kind: str, name: str, base: str) -> "list[str] | None":
+        if kind == "include_relative":
+            got = self._read([self.root / base / name], [self.root])
+        else:
+            got = self._read([d / name for d in self.include_dirs] + [self.root / name],
+                             [*self.include_dirs, self.root])
+        if got is not None and Path(name).suffix.lower() in HTML_EXTS and any("{%" in x for x in got):
+            return []   # a fragment that loops over site data renders nothing without Jekyll
+        return got
+
+    def link_to(self, target: str, base: str) -> str:
+        """A page reference as a link relative to the page at `base`, or as given."""
+        name, _, anchor = target.strip().partition("#")
+        page = self.index.find(name, base) if name else None
+        if page is None and name:
+            key = Path(name.rstrip("/")).name.lower()
+            key = key[:-3] if key.endswith(".md") else key
+            hits = self.index.by_stem.get(key, [])
+            page = hits[0] if hits else None
+        if page is None:
+            return target
+        return posixpath.relpath(page.rel.as_posix(), base or ".") + ("#" + anchor if anchor else "")
+
+    def read_include(self, name: str, base: str) -> "list[str] | None":
+        """The lines of a shared file, only from inside the book or its include folders."""
+        name = name.strip().strip("\"'")
+        if not name:
+            return None
+        candidates = [self.root / name.lstrip("/"), self.root / base / name,
+                      *(d / name.lstrip("/") for d in self.include_dirs)]
+        return self._read(candidates, [self.root, *self.include_dirs])
+
+    @staticmethod
+    def _open_shortcode(name: str, pos: list[str], kw: dict[str, str]):
+        esc = html_mod.escape
+        if name in CALLOUT_SC:
+            kind = kw.get("type") or kw.get("kind") or (
+                pos[0] if pos and name in GENERIC_CALLOUT_SC else name)
+            kind = kind if re.fullmatch(r"[\w-]+", kind or "") else "note"
+            title = kw.get("title") or (pos[1] if name in GENERIC_CALLOUT_SC and len(pos) > 1 else "")
+            return _callout(kind, esc(title)), ["", "</div>", ""]
+        if name in DETAILS_SC:
+            summary = kw.get("title") or kw.get("summary") or (pos[0] if pos else "Details")
+            return (["", '<details markdown="1">', f"<summary>{esc(summary)}</summary>", ""],
+                    ["", "</details>", ""])
+        if name in TABSET_SC:
+            return [], []
+        if name in TAB_SC:
+            label = kw.get("name") or kw.get("title") or kw.get("header") or kw.get("label") \
+                or (pos[0] if pos else "")
+            return (["", f'<p class="tab-label">{esc(label)}</p>', ""] if label else []), []
+        if name in ("figure", "img", "image"):
+            src = kw.get("src") or (pos[0] if pos else "")
+            if not src:
+                return [], []
+            caption = kw.get("caption") or kw.get("title") or ""
+            fig = ["", '<figure markdown="1">', "", f"![{_md_text(kw.get('alt') or caption)}](<{src}>)", ""]
+            if caption:
+                fig.append(f"<figcaption>{esc(caption)}</figcaption>")
+            return fig + ["</figure>", ""], []
+        return None
+
+    def _inline_shortcode(self, m: re.Match, base: str, meta: dict) -> str:
+        if m.group(2):   # a closing tag that no block was waiting for
+            return ""
+        name = m.group(3).lower()
+        pos, kw = _sc_args(m.group(4))
+        first = pos[0] if pos else ""
+        if name in ("ref", "relref"):
+            return self.link_to(first or kw.get("path", ""), base)
+        if name == "param":
+            return html_mod.escape(str(meta.get((first or kw.get("name", "")).lower(), "")))
+        if name in ("new-in", "deprecated-in") and first:
+            word = "New in" if name == "new-in" else "Deprecated in"
+            return f'<span class="badge">{word} {html_mod.escape(first)}</span>'
+        if name == "youtube" and (kw.get("id") or first):
+            return f"[▶ YouTube video](https://www.youtube.com/watch?v={kw.get('id') or first})"
+        if name == "vimeo" and (kw.get("id") or first):
+            return f"[▶ Vimeo video](https://vimeo.com/{kw.get('id') or first})"
+        if name in ("figure", "img", "image") and (kw.get("src") or first):
+            return f"![{_md_text(kw.get('alt', ''))}](<{kw.get('src') or first}>)"
+        if name == "glossary-term" and first:
+            return f"**{first}**"
+        return ""   # shortcodes only the site's own templates know how to render
+
+    @staticmethod
+    def _inline_components(line: str) -> str:
+        """Self-closing components inside a line of prose: a Badge keeps its text,
+        anything else (a live demo, a computed URL) has nothing to show on paper."""
+        spans = [m.span() for m in re.finditer(r"`+[^`]*`+", line)]
+
+        def one(m: re.Match) -> str:
+            if any(a <= m.start() < b for a, b in spans):
+                return m.group(0)
+            attrs = _jsx_attrs(m.group(2))
+            if m.group(1).split(".")[-1] == "Badge" and attrs.get("text"):
+                return f'<span class="badge">{html_mod.escape(attrs["text"])}</span>'
+            return ""
+
+        return MDX_INLINE.sub(one, line)
+
+    def _component(self, tag: str, stack: list, out: list[str]) -> bool:
+        close = MDX_CLOSE.match(tag)
+        if close:
+            for n in range(len(stack) - 1, -1, -1):
+                if stack[n][0] == close.group(1):
+                    out += stack.pop(n)[1]
+                    break
+            return True
+        m = MDX_OPEN.match(tag)
+        if not m:
+            head = re.match(r"^\s*<([A-Z][\w.]*)", tag)
+            if not head or not re.search(r">\s*$", tag):
+                return False
+            # props too rich to read (arrow functions, nested JSX): a live demo has
+            # nothing to show on paper, and a wrapper keeps only its children
+            if not tag.rstrip().endswith("/>"):
+                stack.append((head.group(1), []))
+            return True
+        name, attrs, self_closing = m.group(1), _jsx_attrs(m.group(2)), bool(m.group(3))
+        short = name.split(".")[-1]
+        esc = html_mod.escape
+        start: list[str] = []
+        end: list[str] = []
+        if short in MDX_CALLOUT:
+            kind = attrs.get("type") or (short.lower() if short not in ("Admonition", "Aside", "Callout")
+                                         else "note")
+            start, end = _callout(kind, esc(attrs.get("title", ""))), ["", "</div>", ""]
+        elif short in MDX_LABEL:
+            label = attrs.get("label") or attrs.get("title") or attrs.get("value") or ""
+            start = ["", f'<p class="tab-label">{esc(label)}</p>', ""] if label else []
+        elif short == "LinkCard" and attrs.get("href"):
+            text = attrs.get("title") or attrs["href"]
+            more = f" — {attrs['description']}" if attrs.get("description") else ""
+            start = ["", f"[{_md_text(text)}]({attrs['href']}){more}", ""]
+        elif short == "Badge" and attrs.get("text"):
+            start = [f'<span class="badge">{esc(attrs["text"])}</span>']
+        out += start
+        if not self_closing:
+            stack.append((name, end))
+        return True
+
+    def expand(self, text: str, page: "Page | None", meta: dict) -> str:
+        mdx = bool(page) and page.src.suffix.lower() == ".mdx"
+        if not mdx and "{{" not in text and "{%" not in text and "8<-" not in text:
+            return text
+        self._raw = self._comment = False
+        base = posixpath.dirname(page.rel.as_posix()) if page else ""
+        lines = text.split("\n")
+        out: list[str] = []
+        stack: list[tuple[str, list[str]]] = []   # open blocks and the lines that close them
+        fence = ""
+        raw_close: "re.Pattern | None" = None     # inside a code shortcode
+        raw_indent = ""
+        in_comment = False
+        inserts = 0
+        i = 0
+        while i < len(lines):
+            line = SHORTCODE_ESCAPED.sub(
+                lambda m: f"{LITERAL_BRACES}{m.group(1)} {m.group(2)} {m.group(3)}}}}}", lines[i])
+            i += 1
+            if mdx and any(n[:1].isupper() for n, _ in stack):
+                # component children are often indented with tabs, which Markdown reads as code
+                depth = sum(1 for n, _ in stack if n[:1].isupper())
+                line = re.sub(r"^\t{1,%d}" % depth, "", line)
+            if raw_close is not None:
+                if raw_close.search(line):
+                    out.append(raw_indent + "```")
+                    raw_close = None
+                else:
+                    out.append(line)
+                continue
+            if self.snippet_dirs and "8<-" in line:
+                # pymdownx.snippets runs before Markdown, code blocks included
+                one = SNIPPET_LINE.match(line)
+                if one and one.group(2):   # ;--8<-- shows the marker itself
+                    line = one.group(1) + line.lstrip()[1:]
+                elif (one or SNIPPET_BLOCK.match(line)) and inserts < self.MAX_INSERTS:
+                    names = [one.group(4)] if one else []
+                    if not one:
+                        while i < len(lines) and not SNIPPET_BLOCK.match(lines[i]):
+                            entry = lines[i].strip()
+                            if entry and not entry.startswith(";"):
+                                names.append(entry)
+                            i += 1
+                        i += 1
+                    inserted: list[str] = []
+                    for name in names:
+                        plain = name.split(":", 1)[0] if ":" in name and not (self.root / name).exists() else name
+                        got = self._read([d / plain for d in self.snippet_dirs] + [self.root / plain],
+                                         [*self.snippet_dirs, self.root])
+                        inserted += got or []
+                    inserts += 1
+                    lines[i:i] = inserted
+                    continue
+            if self.liquid:
+                if not (self._raw or self._comment):
+                    hl = LIQUID_HIGHLIGHT.match(line)
+                    if hl:
+                        out.append(hl.group(1) + "```" + hl.group(2))
+                        fence = "```"
+                        continue
+                    if LIQUID_ENDHIGHLIGHT.match(line):
+                        out.append(line[: len(line) - len(line.lstrip())] + "```")
+                        fence = ""
+                        continue
+                    inc = LIQUID_INCLUDE.match(line)
+                    if inc and inserts < self.MAX_INSERTS:
+                        got = self._liquid_include(inc.group(1), inc.group(3), base)
+                        if got is not None:
+                            inserts += 1
+                            lines[i:i] = got
+                            continue
+                # Jekyll and mkdocs-macros render templates inside code blocks too
+                line = self._liquid(line, base, meta)
+                if line is None:
+                    continue
+            if fence:
+                out.append(line)
+                s = line.strip()
+                if s.startswith(fence) and not s.lstrip(fence[0]):
+                    fence = ""
+                continue
+            if mdx:
+                if in_comment:
+                    if "*/}" not in line:
+                        continue
+                    line, in_comment = line.split("*/}", 1)[1], False
+                line = MDX_COMMENT.sub("", line)
+                if "{/*" in line:
+                    line, in_comment = line.split("{/*", 1)[0], True
+            m = FENCE.match(line)
+            if m:
+                fence = m.group(1)
+                out.append(line)
+                continue
+            tail = line.rsplit("{{", 1)[-1] if ("{{<" in line or "{{%" in line) else ""
+            if tail[:1] in ("<", "%") and not re.search(r"[>%]\}\}", tail):
+                # a shortcode whose arguments run over several lines
+                j, joined = i, line
+                while j < len(lines) and j - i < 30:
+                    joined += " " + lines[j].strip()
+                    j += 1
+                    if re.search(r"[>%]\}\}", lines[j - 1]):
+                        line, i = joined, j
+                        break
+            s = line.strip()
+            sc = SHORTCODE.fullmatch(s) if s.startswith("{{") else None
+            if sc:
+                name = sc.group(3).lower()
+                pos, kw = _sc_args(sc.group(4))
+                if sc.group(2):
+                    for n in range(len(stack) - 1, -1, -1):
+                        if stack[n][0] == name:
+                            out += stack.pop(n)[1]
+                            break
+                    continue
+                if name in CODE_SC:
+                    if sc.group(4).strip().endswith("/"):
+                        continue   # renders the site's own config, which the book doesn't have
+                    lang = kw.get("lang") or kw.get("language") or \
+                        (pos[0] if pos and name == "highlight" else "") or \
+                        ("toml" if name == "code-toggle" else "")
+                    raw_indent = line[: len(line) - len(line.lstrip())]   # stay inside a list item
+                    out.append(raw_indent + "```" + lang)
+                    raw_close = re.compile(r"\{\{[<%]\s*/\s*" + re.escape(name) + r"\s*[>%]\}\}")
+                    continue
+                if name in ("include", "readfile") and inserts < self.MAX_INSERTS:
+                    included = self.read_include(pos[0] if pos else kw.get("file", ""), base)
+                    if included is not None:
+                        inserts += 1
+                        lines[i:i] = included
+                        continue
+                opened = self._open_shortcode(name, pos, kw)
+                if opened is not None:
+                    out += opened[0]
+                    if not sc.group(4).strip().endswith("/") and name not in ("figure", "img", "image"):
+                        stack.append((name, opened[1]))
+                    continue
+            if mdx:
+                one = re.match(r"^\s*(<([A-Z][\w.]*)(?:\s[^>]*)?>)(.*)(</\2>)\s*$", line)
+                if one and self._component(one.group(1), stack, out):   # <Aside>text</Aside>
+                    out.append(self._inline_components(one.group(3)))
+                    self._component(one.group(4), stack, out)
+                    continue
+            if mdx and re.match(r"^\s*</?[A-Z]", line):
+                j, tag = i, line
+                # props can hold objects and arrow functions over many lines: the tag ends
+                # at a line-final ">" once its braces balance
+                while j < len(lines) and j - i < 200 and not (
+                        re.search(r">\s*$", tag) and tag.count("{") <= tag.count("}")):
+                    tag += "\n" + lines[j]
+                    j += 1
+                if self._component(tag, stack, out):
+                    i = j
+                    continue
+            if mdx:
+                line = self._inline_components(line)
+            out.append(SHORTCODE.sub(lambda m: self._inline_shortcode(m, base, meta), line))
+        for _, end in reversed(stack):
+            out += end
+        return "\n".join(out).replace(LITERAL_BRACES, "{{")
+
+
 def render_rst(text: str) -> str | None:
     """reStructuredText (Sphinx and most Python projects) to HTML via docutils.
 
@@ -556,18 +2094,21 @@ def render_rst(text: str) -> str | None:
         return None
 
 
-def render_page(page: Page, html_map: dict[str, str], md_map: dict[str, str]) -> None:
+def render_page(page: Page, html_map: dict[str, str], md_map: dict[str, str],
+                links: "WikiLinks | None" = None, templates: "Templates | None" = None) -> None:
     text = page.src.read_text(encoding="utf-8", errors="replace")
     if page.kind == "md":
         meta, body = split_front_matter(text)
         mdx = page.src.suffix.lower() == ".mdx"
-        source = normalize_markdown(body, mdx=mdx)
+        if templates:
+            body = templates.expand(body, page, meta)
+        source = normalize_markdown(body, mdx=mdx, links=links, page=page)
         # generators print the front-matter title themselves when the body has no H1
         if meta.get("title") and not re.match(r"#\s", source.lstrip()):
             source = f"# {meta['title']}\n\n{source}"
         MD_RENDERER.reset()
         page.html_body = rewrite_md_links(MD_RENDERER.convert(source), page, html_map)
-        plain = normalize_markdown(body, mdx=True, callouts=False) if mdx else body
+        plain = normalize_markdown(body, mdx=mdx, callouts=False, links=links, page=page)
         page.md_body = rewrite_links_for_md_book(plain, page, md_map)
     elif page.kind == "rst":
         body = render_rst(text)
@@ -575,6 +2116,9 @@ def render_page(page: Page, html_map: dict[str, str], md_map: dict[str, str]) ->
                           else f"<pre class='plaintext'>{html_mod.escape(text)}</pre>")
         page.md_body = f"```rst\n{text}\n```"
     elif page.kind == "html":
+        meta, text = split_front_matter(text)
+        if templates and templates.liquid:   # a Jekyll page written in HTML is a template too
+            text = templates.expand(text, page, meta)
         body = extract_html_body(text)
         page.html_body = rewrite_md_links(body, page, html_map)
         # markdown renders inline HTML, so the body carries over as-is
@@ -601,6 +2145,15 @@ DARK_TOKENS = """--paper:#15171C;--ink:#DCDEE3;--muted:#8B919B;--accent:#7CC7A1;
 --link:#8ECFAC;--panel:#1B1E24;--border:#2A2E36;--code-bg:#1E222A;
 --tint:rgba(124,199,161,.10);--shadow:rgba(0,0,0,.5);
 --hl:rgba(255,213,79,.26);--hl-note:rgba(124,199,161,.24)"""
+
+# pymdownx.tabbed's alternate style is pure CSS: the n-th checked radio shows the
+# n-th block and marks the n-th label
+TABS_NTH = "\n".join(
+    f"main .tabbed-set>input:nth-child({n}):checked~.tabbed-content>"
+    f".tabbed-block:nth-child({n}){{display:block}}\n"
+    f"main .tabbed-set>input:nth-child({n}):checked~.tabbed-labels>label:nth-child({n})"
+    "{color:var(--accent);border-bottom-color:var(--accent)}"
+    for n in range(1, 21))
 
 CSS = f"""
 :root{{{LIGHT_TOKENS};
@@ -686,12 +2239,57 @@ main hr{{border:0;border-top:1px solid var(--border);margin:2rem 0}}
 main .admonition{{margin:1.2rem 0;padding:.75rem 1rem;background:var(--panel);
 border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:0 8px 8px 0}}
 main .admonition>:last-child{{margin-bottom:0}}
-main .admonition-title{{margin:0 0 .35rem;font-size:.78rem;font-weight:700;
+main .admonition-title{{margin:0 0 .35rem;font-family:var(--sans);font-size:.74rem;font-weight:700;
 letter-spacing:.05em;text-transform:uppercase;color:var(--accent)}}
 main .admonition:is(.warning,.caution,.attention){{border-left-color:#C98A1B}}
 main .admonition:is(.warning,.caution,.attention) .admonition-title{{color:#C98A1B}}
 main .admonition:is(.danger,.error,.important){{border-left-color:#C4453C}}
 main .admonition:is(.danger,.error,.important) .admonition-title{{color:#C4453C}}
+main details{{margin:1.2rem 0;padding:.6rem 1rem;background:var(--panel);
+border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:0 8px 8px 0}}
+main details>summary{{cursor:pointer;font-family:var(--sans);font-size:.86rem;
+font-weight:600;color:var(--ink)}}
+main details[open]>summary{{margin-bottom:.4rem}}
+main details>:last-child{{margin-bottom:0}}
+main details:is(.warning,.caution,.attention){{border-left-color:#C98A1B}}
+main details:is(.danger,.error,.important){{border-left-color:#C4453C}}
+main .task-list{{list-style:none;padding-left:.3rem}}
+main .task-list-item input{{margin:0 .55rem 0 0;accent-color:var(--accent);
+vertical-align:middle}}
+main del{{color:var(--muted)}}
+main mark{{background:var(--hl);color:inherit;padding:0 .15em;border-radius:3px}}
+main figure{{margin:1.5rem 0;text-align:center}}
+main figure p{{margin:0}}
+main figcaption{{font-family:var(--sans);font-size:.82rem;color:var(--muted);margin-top:.45rem}}
+main .wikilink.missing{{color:var(--muted);border-bottom:1px dashed var(--muted);cursor:help}}
+main .embed{{margin:1.3rem 0;padding:.15rem 0 .15rem 1.1rem;border-left:3px solid var(--border)}}
+main .embed>:last-child{{margin-bottom:0}}
+main .code-title{{margin:1.1rem 0 0;padding:.4rem 1rem;font-family:var(--mono);font-size:.76rem;
+color:var(--muted);background:var(--panel);border:1px solid var(--border);border-bottom:0;
+border-radius:8px 8px 0 0}}
+main .code-title+.highlight .codewrap,main .code-title+.highlight pre{{margin-top:0}}
+main .code-title+.highlight pre{{border-top-left-radius:0;border-top-right-radius:0}}
+main .badge{{display:inline-block;font-family:var(--sans);font-size:.7rem;font-weight:600;
+line-height:1.5;padding:0 .5rem;border-radius:999px;border:1px solid var(--border);
+background:var(--tint);color:var(--accent);white-space:nowrap;vertical-align:.1em}}
+main .embed-source{{margin:0 0 .3rem;font-family:var(--sans);font-size:.72rem;
+letter-spacing:.06em;text-transform:uppercase}}
+main .embed-source a{{color:var(--muted)}}
+main .tab-label{{font-family:var(--sans);font-size:.78rem;font-weight:700;
+letter-spacing:.05em;text-transform:uppercase;color:var(--accent);margin:1.3rem 0 .3rem}}
+main .tabbed-set{{position:relative;display:flex;flex-wrap:wrap;margin:1.2rem 0;
+border:1px solid var(--border);border-radius:8px}}
+main .tabbed-set>input{{position:absolute;opacity:0;pointer-events:none}}
+main .tabbed-set>input:focus-visible~.tabbed-labels{{outline:2px solid var(--accent);
+outline-offset:-2px}}
+main .tabbed-labels{{display:flex;width:100%;overflow-x:auto;font-family:var(--sans);
+border-bottom:1px solid var(--border)}}
+main .tabbed-labels>label{{padding:.5rem .95rem;font-size:.82rem;color:var(--muted);
+cursor:pointer;white-space:nowrap;border-bottom:2px solid transparent;margin-bottom:-1px}}
+main .tabbed-labels>label:hover{{color:var(--ink)}}
+main .tabbed-content{{width:100%;padding:0 1rem}}
+main .tabbed-block{{display:none}}
+{TABS_NTH}
 main blockquote{{margin:1.2rem 0;padding:.15rem 0 .15rem 1.1rem;
 border-left:3px solid var(--accent);color:var(--muted);font-style:italic}}
 main table{{border-collapse:collapse;font-family:var(--sans);font-size:.9rem;
@@ -786,6 +2384,37 @@ white-space:nowrap}}
 background:none;border:1px solid var(--border);border-radius:999px;
 padding:.3rem .7rem;cursor:pointer;flex-shrink:0}}
 #notesbtn:hover{{color:var(--ink);border-color:var(--muted)}}
+/* ---- search ---- */
+#searchbtn{{margin-left:auto;display:flex;align-items:center;gap:.5rem;font:.76rem var(--sans);
+color:var(--muted);background:var(--paper);border:1px solid var(--border);border-radius:999px;
+padding:.26rem .4rem .26rem .8rem;cursor:pointer;flex-shrink:0}}
+#searchbtn:hover{{color:var(--ink);border-color:var(--muted)}}
+#searchbtn kbd{{font:.66rem var(--mono);color:var(--muted);background:var(--panel);
+border:1px solid var(--border);border-radius:5px;padding:.05rem .38rem}}
+#searchbtn+#notesbtn{{margin-left:0}}
+#searchbox .sb-back{{position:fixed;inset:0;z-index:80;background:rgba(20,18,14,.34)}}
+#searchbox .sb-panel{{position:fixed;z-index:81;top:12vh;left:50%;transform:translateX(-50%);
+width:min(660px,94vw);max-height:72vh;display:flex;flex-direction:column;overflow:hidden;
+background:var(--panel);border:1px solid var(--border);border-radius:12px;
+box-shadow:0 18px 60px var(--shadow);font-family:var(--sans)}}
+#searchbox input{{border:0;border-bottom:1px solid var(--border);background:transparent;
+color:var(--ink);font:1rem var(--sans);padding:1rem 1.15rem;outline:none;appearance:none}}
+#searchbox input::-webkit-search-cancel-button{{display:none}}
+#searchbox .sb-results{{list-style:none;margin:0;padding:.35rem;overflow-y:auto}}
+#searchbox li{{display:flex;flex-direction:column;gap:.18rem;padding:.6rem .8rem;
+border-radius:8px;cursor:pointer}}
+#searchbox li[aria-selected="true"],#searchbox li[data-i]:hover{{background:var(--tint)}}
+#searchbox .sb-title{{font-size:.9rem;font-weight:600;color:var(--ink)}}
+#searchbox .sb-sep{{color:var(--muted);font-weight:400}}
+#searchbox .sb-path{{font-size:.66rem;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}}
+#searchbox .sb-snip{{font-size:.8rem;line-height:1.45;color:var(--muted)}}
+#searchbox mark{{background:var(--hl);color:var(--ink);border-radius:2px;padding:0 .05em}}
+#searchbox .sb-empty{{cursor:default;color:var(--muted);font-size:.85rem}}
+#searchbox .sb-foot{{display:flex;gap:1.1rem;padding:.5rem 1.1rem;border-top:1px solid var(--border);
+font-size:.68rem;color:var(--muted)}}
+::highlight(bk-search){{background-color:var(--hl);text-decoration:underline 2px var(--accent)}}
+@media(max-width:860px){{#searchbtn kbd,#searchbox .sb-foot{{display:none}}
+#searchbox .sb-panel{{top:4vh;max-height:88vh}}}}
 #notespanel{{position:fixed;top:0;right:0;bottom:0;width:min(360px,92vw);z-index:50;
 background:var(--panel);border-left:1px solid var(--border);
 box-shadow:0 0 30px var(--shadow);padding:1.1rem;overflow-y:auto;
@@ -900,6 +2529,20 @@ apply();
 if(btn)btn.addEventListener('click',()=>{mode={auto:'light',light:'dark',dark:'auto'}[mode];
 try{localStorage.setItem(KEY,mode)}catch(e){}apply();});})();
 
+// ---- shared sidebar: a large book ships its tree once, in nav.js; fill it in here,
+// before the filter below looks at it ----
+(()=>{const tree=document.querySelector('nav.sidebar .tree[data-shared]');
+if(!tree||typeof window.BOOKIFY_NAV!=='string')return;
+const ROOT=document.body.dataset.root||'',PAGE=document.body.dataset.page||'';
+tree.innerHTML=window.BOOKIFY_NAV;
+let active=null;
+tree.querySelectorAll('a[href]').forEach(a=>{const h=a.getAttribute('href');
+if(h===PAGE){active=a;a.classList.add('active');
+for(let d=a.closest('details');d;d=d.parentElement.closest('details'))d.open=true}
+a.setAttribute('href',ROOT+h)});
+if(active){const t=tree.getBoundingClientRect(),r=active.getBoundingClientRect();
+tree.scrollTop+=r.top-t.top-tree.clientHeight/2}})();
+
 // ---- sidebar filter ----
 (()=>{const q=document.getElementById('navfilter');if(!q)return;
 const tree=document.querySelector('nav.sidebar .tree');if(!tree)return;
@@ -958,6 +2601,85 @@ b.addEventListener('click',()=>{
 navigator.clipboard.writeText(pre.innerText).then(()=>{b.classList.add('done');
 setTimeout(()=>b.classList.remove('done'),1200)}).catch(()=>{})});
 wrap.appendChild(b);});})();
+
+// ---- search: Ctrl/Cmd+K opens a finder over every page's text. The index is a
+// script (search.js) rather than JSON so it loads when the book is opened off disk ----
+(()=>{const ROOT=document.body.dataset.root||'';
+const btn=document.getElementById('searchbtn');
+const mac=/Mac|iPhone|iPad/.test(navigator.platform||'');
+if(btn){const k=btn.querySelector('kbd');if(k)k.textContent=mac?'⌘K':'Ctrl K'}
+let docs=null,loading=null,box=null,input=null,list=null,sel=0,hits=[];
+const store=(k,v)=>{try{v===undefined?sessionStorage.removeItem(k):sessionStorage.setItem(k,v)}catch(e){}};
+const read=k=>{try{return sessionStorage.getItem(k)||''}catch(e){return ''}};
+const load=()=>{if(docs)return Promise.resolve(docs);if(loading)return loading;
+loading=new Promise(res=>{const s=document.createElement('script');s.src=ROOT+'search.js';
+s.onload=()=>{docs=window.BOOKIFY_SEARCH||[];res(docs)};s.onerror=()=>{docs=[];res(docs)};
+document.head.appendChild(s)});return loading};
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const mark=(s,terms)=>{const low=s.toLowerCase(),spans=[];
+for(const t of terms){let i=low.indexOf(t);while(i>=0){spans.push([i,i+t.length]);i=low.indexOf(t,i+t.length)}}
+spans.sort((a,b)=>a[0]-b[0]);let out='',pos=0;
+for(const [a,b] of spans){if(a<pos)continue;out+=esc(s.slice(pos,a))+'<mark>'+esc(s.slice(a,b))+'</mark>';pos=b}
+return out+esc(s.slice(pos))};
+const count=(s,t)=>{let n=0,i=s.indexOf(t);while(i>=0&&n<5){n++;i=s.indexOf(t,i+t.length)}return n};
+const snip=(text,terms)=>{const low=text.toLowerCase();let at=-1;
+for(const t of terms){const i=low.indexOf(t);if(i>=0&&(at<0||i<at))at=i}
+const start=Math.max(0,at-60),s=text.slice(start,start+200);
+return (start>0?'…':'')+mark(s,terms)+(start+200<text.length?'…':'')};
+const paint=()=>{[...list.querySelectorAll('li[data-i]')].forEach((li,i)=>{
+if(i===sel){li.setAttribute('aria-selected','true');li.scrollIntoView({block:'nearest'})}
+else li.removeAttribute('aria-selected')})};
+function run(){const raw=input.value.trim(),q=raw.toLowerCase();store('bookify-q',raw);
+const terms=q.split(/\\s+/).filter(Boolean);hits=[];sel=0;
+if(!terms.length){list.innerHTML='';return}
+if(!docs){list.innerHTML='<li class="sb-empty">Loading…</li>';return}
+for(const d of docs){const tl=d.t.toLowerCase();
+for(const [id,h,text] of d.p){const hl=h.toLowerCase(),xl=text.toLowerCase();let score=0,ok=true;
+for(const t of terms){const inT=tl.includes(t),inH=hl.includes(t),n=count(xl,t);
+if(!inT&&!inH&&!n){ok=false;break}score+=(inT?12:0)+(inH?6:0)+n}
+if(!ok)continue;
+if(terms.length>1&&(xl.includes(q)||hl.includes(q)||tl.includes(q)))score+=8;
+hits.push({d,id,h,text,score})}}
+hits.sort((a,b)=>b.score-a.score);hits=hits.slice(0,50);
+list.innerHTML=hits.length?hits.map((r,i)=>'<li role="option" data-i="'+i+'">'+
+'<span class="sb-title">'+mark(r.d.t,terms)+(r.h&&r.h!==r.d.t?' <span class="sb-sep">›</span> '+mark(r.h,terms):'')+'</span>'+
+(r.d.s?'<span class="sb-path">'+esc(r.d.s)+'</span>':'')+
+(r.text?'<span class="sb-snip">'+snip(r.text,terms)+'</span>':'')+'</li>').join('')
+:'<li class="sb-empty">No results for “'+esc(raw)+'”</li>';
+paint()}
+const go=i=>{const r=hits[i];if(!r)return;store('bookify-q-go',input.value.trim());close();
+location.href=ROOT+r.d.u+(r.id?'#'+r.id:'')};
+const build=()=>{box=document.createElement('div');box.id='searchbox';box.hidden=true;
+box.innerHTML='<div class="sb-back"></div><div class="sb-panel" role="dialog" aria-label="Search the book">'+
+'<input type="search" placeholder="Search the book…" aria-label="Search the book" autocomplete="off" spellcheck="false">'+
+'<ul class="sb-results" role="listbox"></ul>'+
+'<div class="sb-foot"><span>↑↓ move</span><span>Enter open</span><span>Esc close</span></div></div>';
+document.body.appendChild(box);input=box.querySelector('input');list=box.querySelector('.sb-results');
+box.querySelector('.sb-back').addEventListener('click',close);
+input.addEventListener('input',run);
+input.addEventListener('keydown',e=>{
+if(e.key==='ArrowDown'){e.preventDefault();sel=Math.min(sel+1,hits.length-1);paint()}
+else if(e.key==='ArrowUp'){e.preventDefault();sel=Math.max(sel-1,0);paint()}
+else if(e.key==='Enter'){e.preventDefault();go(sel)}
+else if(e.key==='Escape'){e.preventDefault();close()}});
+list.addEventListener('click',e=>{const li=e.target.closest('li[data-i]');if(li)go(+li.dataset.i)})};
+function open(){if(!box)build();box.hidden=false;document.body.classList.add('search-open');
+input.value=read('bookify-q');input.select();input.focus();load().then(run)}
+function close(){if(!box)return;box.hidden=true;document.body.classList.remove('search-open')}
+if(btn)btn.addEventListener('click',open);
+addEventListener('keydown',e=>{if((e.ctrlKey||e.metaKey)&&!e.altKey&&e.key.toLowerCase()==='k'){
+e.preventDefault();box&&!box.hidden?close():open()}});
+// arriving from a result: mark the terms on this page (Esc clears them)
+const q=read('bookify-q-go');store('bookify-q-go');
+const main=document.querySelector('main');
+if(q&&main&&'highlights'in CSS){const terms=q.toLowerCase().split(/\\s+/).filter(Boolean);
+const ranges=[],walk=document.createTreeWalker(main,NodeFilter.SHOW_TEXT);
+while(walk.nextNode()){const n=walk.currentNode,low=n.data.toLowerCase();
+for(const t of terms){let i=low.indexOf(t);while(i>=0&&ranges.length<500){
+const r=new Range();r.setStart(n,i);r.setEnd(n,i+t.length);ranges.push(r);i=low.indexOf(t,i+t.length)}}}
+if(ranges.length){CSS.highlights.set('bk-search',new Highlight(...ranges));
+if(!location.hash)ranges[0].startContainer.parentElement.scrollIntoView({block:'center'});
+addEventListener('keydown',e=>{if(e.key==='Escape')CSS.highlights.delete('bk-search')})}}})();
 
 // ---- keyboard: arrows page through the book, "/" focuses the filter ----
 addEventListener('keydown',e=>{
@@ -1445,37 +3167,43 @@ THEME_INIT = ("try{var t=localStorage.getItem('bookify-theme');"
 
 
 def build_tree(pages: list[Page]) -> dict:
-    tree: dict = {"dirs": {}, "pages": []}
+    """Nest pages by their section labels. Children keep reading order, with pages
+    and sections interleaved, so a nav config that puts a page after a section
+    is shown that way."""
+    tree: dict = {"children": [], "dirs": {}}
     for p in pages:
         node = tree
-        for part in p.rel.parts[:-1]:
-            node = node["dirs"].setdefault(part, {"dirs": {}, "pages": []})
-        node["pages"].append(p)
+        for label in p.section:
+            sub = node["dirs"].get(label)
+            if sub is None:
+                sub = node["dirs"][label] = {"label": label, "children": [], "dirs": {}}
+                node["children"].append(sub)
+            node = sub
+        node["children"].append(p)
     return tree
 
 
 def nav_html(tree: dict, current: Page, depth_to_root: str) -> str:
     out = ["<ul>"]
-    for p in tree["pages"]:
-        active = ' class="active"' if p is current else ""
-        href = depth_to_root + str(p.out_rel_html).replace("\\", "/")
-        out.append(
-            f'<li data-t="{html_mod.escape(p.title.lower())}">'
-            f'<a href="{href}"{active}>{html_mod.escape(p.title)}</a></li>'
-        )
-    for name, sub in sorted(tree["dirs"].items(), key=lambda kv: kv[0].lower()):
-        is_open = " open" if str(current.rel).startswith(name) or _contains(sub, current) else ""
-        out.append(f"<details{is_open}><summary>{html_mod.escape(humanize(name))}</summary>")
-        out.append(nav_html(sub, current, depth_to_root))
-        out.append("</details>")
+    for child in tree["children"]:
+        if isinstance(child, Page):
+            active = ' class="active"' if child is current else ""
+            href = depth_to_root + str(child.out_rel_html).replace("\\", "/")
+            out.append(
+                f'<li data-t="{html_mod.escape(child.title.lower())}">'
+                f'<a href="{href}"{active}>{html_mod.escape(child.title)}</a></li>')
+        else:
+            is_open = " open" if _contains(child, current) else ""
+            out.append(f"<details{is_open}><summary>{html_mod.escape(child['label'])}</summary>")
+            out.append(nav_html(child, current, depth_to_root))
+            out.append("</details>")
     out.append("</ul>")
     return "".join(out)
 
 
 def _contains(tree: dict, page: Page) -> bool:
-    if any(p is page for p in tree["pages"]):
-        return True
-    return any(_contains(sub, page) for sub in tree["dirs"].values())
+    return any(c is page if isinstance(c, Page) else _contains(c, page)
+               for c in tree["children"])
 
 
 def write_html_book(pages: list[Page], tree: dict, out: Path, title: str,
@@ -1494,12 +3222,21 @@ def write_html_book(pages: list[Page], tree: dict, out: Path, title: str,
     out.mkdir(parents=True, exist_ok=True)
     (out / "book.css").write_text(CSS + "\n" + hl_css, encoding="utf-8")
     (out / "book.js").write_text(JS, encoding="utf-8")
+    shared_nav = len(pages) > NAV_INLINE_LIMIT
+    if shared_nav:
+        import json as jsonlib
+        (out / "nav.js").write_text(
+            "window.BOOKIFY_NAV=" + jsonlib.dumps(nav_html(tree, None, ""), ensure_ascii=False) + ";\n",
+            encoding="utf-8")
 
     for page in pages:
         dest = out / page.out_rel_html
         dest.parent.mkdir(parents=True, exist_ok=True)
         to_root = "../" * (len(page.out_rel_html.parts) - 1)
-        crumb_parts = [title] + [humanize(p) for p in page.rel.parts[:-1]] + [page.title]
+        crumb_parts = [title, *page.section, page.title]
+        tree_html = "" if shared_nav else nav_html(tree, page, to_root)
+        tree_attr = ' data-shared="1"' if shared_nav else ""
+        nav_script = f'<script src="{to_root}nav.js" defer></script>' if shared_nav else ""
         crumbs = '<span class="sep">/</span>'.join(html_mod.escape(c) for c in crumb_parts)
         pager = []
         if page.prev:
@@ -1519,7 +3256,7 @@ def write_html_book(pages: list[Page], tree: dict, out: Path, title: str,
 <title>{html_mod.escape(page.title)} — {html_mod.escape(title)}</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>📖</text></svg>">
 <script>{THEME_INIT}</script>
-<link rel="stylesheet" href="{to_root}book.css"><script src="{to_root}book.js" defer></script>
+<link rel="stylesheet" href="{to_root}book.css">{nav_script}<script src="{to_root}book.js" defer></script>
 </head><body data-root="{to_root}" data-book="{html_mod.escape(book_id)}"
  data-book-title="{html_mod.escape(title)}"
  data-page="{html_mod.escape(str(page.out_rel_html).replace(chr(92), "/"))}"><div class="layout">
@@ -1528,11 +3265,12 @@ def write_html_book(pages: list[Page], tree: dict, out: Path, title: str,
 <button id="themetoggle" type="button" title="Cycle theme: auto / light / dark">&#9680;</button></div>
 <input id="navfilter" type="search" placeholder="Filter pages&hellip;">
 <div class="side-tools"><a href="{to_root}__map__.html">Book map</a></div>
-<div class="tree">{nav_html(tree, page, to_root)}</div>
+<div class="tree"{tree_attr}>{tree_html}</div>
 </nav>
 <div class="content">
 <div class="topbar"><button id="menubtn" type="button" aria-label="Toggle navigation">&#9776;</button>
 <div class="crumbs">{crumbs}</div>
+<button id="searchbtn" type="button" aria-label="Search the book"><span>Search</span><kbd>Ctrl K</kbd></button>
 <button id="notesbtn" type="button">Notes</button></div>
 <div class="page-grid">
 <main>
@@ -1555,6 +3293,48 @@ def write_html_book(pages: list[Page], tree: dict, out: Path, title: str,
             f'<a href="{first}">Open book</a>', encoding="utf-8")
 
 
+SEARCH_HEADING = re.compile(r"<h([1-4])([^>]*)>(.*?)</h\1>", re.S | re.I)
+
+
+def _plain_text(fragment: str) -> str:
+    text = re.sub(r"<[^>]+>", " ", fragment)
+    return re.sub(r"\s+", " ", html_mod.unescape(text)).strip()
+
+
+def search_sections(body_html: str, limit: int = 40000) -> list[list[str]]:
+    """A page's text split at its headings: [[heading id, heading, text], ...]."""
+    body = re.sub(r"<(script|style|svg)\b[^>]*>.*?</\1>", " ", body_html, flags=re.S | re.I)
+    parts: list[list[str]] = []
+    pos, sid, heading = 0, "", ""
+    for m in SEARCH_HEADING.finditer(body):
+        text = _plain_text(body[pos:m.start()])
+        if text or heading:
+            parts.append([sid, heading, text])
+        found = re.search(r'\bid="([^"]+)"', m.group(2))
+        sid, heading, pos = (found.group(1) if found else ""), _plain_text(m.group(3)), m.end()
+    tail = _plain_text(body[pos:])
+    if tail or heading:
+        parts.append([sid, heading, tail])
+    out, budget = [], limit
+    for sid, heading, text in parts:   # very long pages keep their opening sections
+        out.append([sid, heading, text[:max(budget, 0)]])
+        budget -= len(text)
+        if budget <= 0:
+            break
+    return out
+
+
+def write_search_index(pages: list[Page], out: Path) -> None:
+    """search.js for the in-book search, as a script so it also works over file://."""
+    import json as jsonlib
+
+    docs = [{"t": p.title, "u": p.out_rel_html.as_posix(), "s": " › ".join(p.section),
+             "p": search_sections(p.html_body)} for p in pages]
+    (out / "search.js").write_text(
+        "window.BOOKIFY_SEARCH=" + jsonlib.dumps(docs, ensure_ascii=False, separators=(",", ":")) + ";\n",
+        encoding="utf-8")
+
+
 # ----------------------------------------------------------------------------
 # Book map (interactive mind-map of structure + cross-links)
 
@@ -1564,7 +3344,7 @@ def write_map_page(pages: list[Page], out: Path, title: str) -> None:
     nodes = [{"id": "", "label": title, "kind": "root"}]
     folders = sorted({"/".join(p.rel.parts[:i])
                       for p in pages for i in range(1, len(p.rel.parts))})
-    nodes += [{"id": "dir:" + f, "label": humanize(f.rsplit("/", 1)[-1]),
+    nodes += [{"id": "dir:" + f, "label": humanize(f.rsplit("/", 1)[-1], is_dir=True),
                "kind": "dir"} for f in folders]
     page_ids = set()
     for p in pages:
@@ -2000,6 +3780,7 @@ def write_md_book(pages: list[Page], out: Path, title: str) -> None:
     out.mkdir(parents=True, exist_ok=True)
     summary = [f"# {title}\n", "## Table of Contents\n"]
     combined = [f"# {title}\n"]
+    shown: tuple = ()
     for page in pages:
         dest = out / page.out_rel_md
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -2007,7 +3788,15 @@ def write_md_book(pages: list[Page], out: Path, title: str) -> None:
         if page.kind != "md" or not re.match(r"^#\s", body.lstrip()):
             body = f"# {page.title}\n\n{body}"
         dest.write_text(body, encoding="utf-8")
-        indent = "  " * (len(page.rel.parts) - 1)
+        # a bold entry for each section entered, the way mdBook's own SUMMARY.md reads
+        common = 0
+        while (common < min(len(shown), len(page.section))
+               and shown[common] == page.section[common]):
+            common += 1
+        for depth in range(common, len(page.section)):
+            summary.append(f"{'  ' * depth}- **{page.section[depth]}**")
+        shown = page.section
+        indent = "  " * len(page.section)
         link = str(page.out_rel_md).replace("\\", "/")
         summary.append(f"{indent}- [{page.title}]({link})")
         combined.append(f"\n---\n\n<!-- source: {page.rel} -->\n\n{body}\n")
@@ -2083,10 +3872,14 @@ def main() -> int:
         print("bookify: no documentation files found "
               "(try --include-code to render source files too)", file=sys.stderr)
         return 1
+    print(f"Navigation:    {arrange(pages, root)}")
+    link_pages(pages)
 
     html_map, md_map = build_link_maps(pages)
+    links = WikiLinks(pages, root)
+    templates = Templates(root, links.index)
     for p in pages:
-        render_page(p, html_map, md_map)
+        render_page(p, html_map, md_map, links, templates)
 
     # wipe + rebuild the output, carrying user data (notes, AI cache) across
     preserved = {}
@@ -2116,6 +3909,7 @@ def main() -> int:
     if args.format in ("html", "both"):
         write_html_book(pages, tree, out / "html", title, book_id)
         write_map_page(pages, out / "html", title)
+        write_search_index(pages, out / "html")
         dests.append(out / "html")
         print(f"HTML book:     {out / 'html' / 'index.html'}")
     if args.format in ("md", "both"):

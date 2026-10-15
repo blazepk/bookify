@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -70,10 +71,10 @@ def child_env(extra: dict | None = None) -> dict:
     return env
 
 
-def run_build(src: Path, out: Path, *extra: str) -> subprocess.CompletedProcess:
+def run_build(src: Path, out: Path, *extra: str, env: dict | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(
         [*BOOKIFY_CMD, str(src), "--no-serve", "-o", str(out), *extra],
-        capture_output=True, text=True, cwd=ROOT, timeout=600, env=child_env())
+        capture_output=True, text=True, cwd=ROOT, timeout=600, env=child_env(env))
 
 
 def get(url: str, timeout: float = 10) -> tuple[int, bytes]:
@@ -299,6 +300,450 @@ def test_build(tmp: Path) -> None:
     check("output dir is gitignored",
           (out / ".gitignore").read_text().strip() == "*")
 
+    search = (html / "search.js").read_text(encoding="utf-8") if (html / "search.js").is_file() else ""
+    check("search index written",
+          search.startswith("window.BOOKIFY_SEARCH=") and "MARKER_ALT" in search and "Alt Page" in search)
+    if shutil.which("node") and search:
+        rc = subprocess.run(["node", "--check", str(html / "search.js")], capture_output=True, text=True)
+        check("search.js parses", rc.returncode == 0, rc.stderr.strip()[-200:])
+    check("search button in every page", 'id="searchbtn"' in (html / "README.html").read_text(encoding="utf-8"))
+
+    # a large book ships its sidebar once instead of inside every page
+    shared = tmp / "out-shared-nav"
+    r = run_build(src, shared, env={"BOOKIFY_INLINE_NAV_LIMIT": "1"})
+    readme = (shared / "html" / "README.html").read_text(encoding="utf-8") if r.returncode == 0 else ""
+    nav = (shared / "html" / "nav.js").read_text(encoding="utf-8") if (shared / "html" / "nav.js").is_file() else ""
+    check("shared sidebar written once",
+          nav.startswith("window.BOOKIFY_NAV=") and "guide/page.html" in nav, (r.stderr or "")[-200:])
+    check("pages load the shared sidebar instead of carrying it",
+          'data-shared="1"' in readme and 'src="nav.js"' in readme and ">Guide Page</a>" not in readme)
+
+
+def sidebar(page: Path) -> list[str]:
+    """The sidebar in reading order: page links as their text, sections as §label."""
+    text = page.read_text(encoding="utf-8")
+    tree = text.split('<div class="tree">', 1)[1].split("</nav>", 1)[0]
+    return [("§" + m.group(1)) if m.group(1) is not None else m.group(2)
+            for m in re.finditer(r'<summary>([^<]*)</summary>|<a href="[^"]*"(?: class="active")?>([^<]*)</a>',
+                                 tree)]
+
+
+def write_files(root: Path, files: dict[str, str]) -> None:
+    for rel, text in files.items():
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_text(text, encoding="utf-8")
+
+
+def test_navigation(tmp: Path) -> None:
+    print("navigation")
+    cases = []
+
+    # MkDocs: nav in mkdocs.yml one level above docs_dir, with a tag PyYAML doesn't know
+    write_files(tmp / "nav-mkdocs", {
+        "mkdocs.yml": ("site_name: T\ndocs_dir: docs\nmarkdown_extensions:\n"
+                       "  - pymdownx.emoji:\n"
+                       "      emoji_index: !!python/name:material.extensions.emoji.twemoji\n"
+                       "nav:\n  - Home: index.md\n  - Guide:\n    - guide/b.md\n"
+                       "    - Custom A: guide/a.md\n  - About: about.md\n"
+                       "  - External: https://example.com\n"),
+        "docs/index.md": "# Home\n", "docs/guide/a.md": "# A\n", "docs/guide/b.md": "# B\n",
+        "docs/about.md": "# About\n", "docs/zextra.md": "# Extra\n"})
+    cases.append(("mkdocs nav", tmp / "nav-mkdocs" / "docs", "index.html", "mkdocs.yml nav",
+                  ["Home", "§Guide", "B", "Custom A", "About", "Extra"]))
+
+    # mdBook: SUMMARY.md with a prefix chapter, part title, nesting and a draft chapter
+    write_files(tmp / "nav-mdbook", {
+        "src/SUMMARY.md": ("# Summary\n\n[Introduction](README.md)\n\n# User guide\n\n"
+                           "- [Install](guide/install.md)\n- [CLI](cli/README.md)\n"
+                           "    - [build](cli/build.md)\n    - [Draft]()\n"),
+        "src/README.md": "# Intro\n", "src/guide/install.md": "# Installing\n",
+        "src/cli/README.md": "# Command line\n", "src/cli/build.md": "# Build\n"})
+    cases.append(("mdbook summary", tmp / "nav-mdbook" / "src", "README.html", "SUMMARY.md",
+                  ["Introduction", "§User guide", "Install", "§CLI", "Command line", "build"]))
+
+    # Sphinx: captions, a borrowed heading, a titled entry, nesting, glob, and MyST
+    write_files(tmp / "nav-sphinx", {
+        "conf.py": 'project = "P"\nroot_doc = "index"\n',
+        "index.rst": ("Project\n=======\n\n.. toctree::\n   :caption: Guide\n\n   usage\n"
+                      "   Setup <install>\n   notes\n\nAPI\n---\n\n.. toctree::\n   :glob:\n\n   api/*\n"),
+        "usage.rst": "Usage\n=====\n\nText.\n\n.. toctree::\n\n   advanced\n",
+        "advanced.rst": "Advanced\n========\n", "install.rst": "Install\n=======\n",
+        "notes.md": "# Notes\n\n```{toctree}\n:caption: More\ndeep\n```\n",
+        "deep.md": "# Deep\n", "api/b.rst": "B\n=\n", "api/a.rst": "A\n=\n"})
+    cases.append(("sphinx toctree", tmp / "nav-sphinx", "index.html", "Sphinx toctree",
+                  ["Project", "§Guide", "§Usage", "Usage", "Advanced", "Setup", "§Notes", "Notes",
+                   "§More", "Deep", "§API", "A", "B"]))
+
+    # Jekyll: _data/docs_nav.yml pointing at permalinks, with templates that aren't pages
+    write_files(tmp / "nav-jekyll", {
+        "_config.yml": "title: Site\n",
+        "_data/docs_nav.yml": ("- title: Getting Started\n  docs:\n    - link: /docs/\n"
+                               "    - link: /docs/installation/\n- title: Build\n  docs:\n"
+                               "    - link: /docs/usage/\n"),
+        "_docs/index.md": "---\ntitle: Home\npermalink: /docs/\n---\nWelcome.\n",
+        "_docs/installation.md": '---\ntitle: Installation\npermalink: "/docs/installation/"\n---\nSteps.\n',
+        "_docs/usage.md": "# Usage\n",
+        "_layouts/default.html": "<html><body>{{ content }}</body></html>\n",
+        "_includes/note.html": "<div>note</div>\n"})
+    cases.append(("jekyll data nav", tmp / "nav-jekyll", "_docs/index.html", "_data/docs_nav.yml",
+                  ["§Getting Started", "Home", "Installation", "§Build", "Usage"]))
+
+    # no nav config: Docusaurus _category_.json, Hugo _index.md, number prefixes, natural sort
+    write_files(tmp / "nav-folders", {
+        "index.md": "# Welcome\n",
+        "guide/_category_.json": '{"label": "The Guide", "position": 1}',
+        "guide/page10.md": "# Page 10\n", "guide/page2.md": "# Page 2\n",
+        "api/_index.md": "---\ntitle: API Reference\nweight: 2\n---\nAll of it.\n",
+        "3-early/y.md": "# Y\n", "10-late/x.md": "# X\n"})
+    cases.append(("folder metadata", tmp / "nav-folders", "index.html", "folders",
+                  ["Welcome", "§The Guide", "Page 2", "Page 10", "§API Reference", "API Reference",
+                   "§Early", "Y", "§Late", "X"]))
+
+    # Docusaurus: a typed sidebars.ts with categories, doc links, ids, autogenerated
+    # folders, external links and a spread the parser can't know
+    write_files(tmp / "nav-docusaurus", {
+        "docusaurus.config.js": "module.exports = {title: 'T'};\n",
+        "sidebars.ts": (
+            "import type {SidebarsConfig} from '@docusaurus/plugin-content-docs';\n"
+            "// a comment { with braces ]\nconst extraItems = [];\n"
+            "const sidebars: SidebarsConfig = {\n  docs: [\n    'intro',\n    {\n"
+            "      type: 'category',\n      label: 'Guides',\n"
+            "      link: {type: 'doc', id: 'guides/overview'},\n"
+            "      items: ['guides/setup', {type: 'doc', id: 'guides/custom-id', label: 'Renamed'}],\n"
+            "    },\n    {type: 'category', label: 'Reference', items: [{type: 'autogenerated', dirName: 'reference'}]},\n"
+            "    {type: 'link', label: 'External', href: 'https://example.com'},\n"
+            "    ...extraItems,\n  ],\n};\nexport default sidebars;\n"),
+        "docs/intro.md": "# Intro\n", "docs/guides/overview.md": "# Overview\n",
+        "docs/guides/setup.mdx": "# Setup\n",
+        "docs/guides/zz-other.md": "---\nid: custom-id\n---\n# Other Page\n",
+        "docs/reference/b.md": "# B\n", "docs/reference/a.md": "# A\n", "docs/stray.md": "# Stray\n"})
+    cases.append(("docusaurus sidebars", tmp / "nav-docusaurus" / "docs", "intro.html", "sidebars.ts",
+                  ["Intro", "§Guides", "Overview", "Setup", "Renamed", "§Reference", "A", "B", "Stray"]))
+
+    # Starlight: slugs, autogenerate, translations to ignore, and a locale folder to drop
+    write_files(tmp / "nav-starlight", {
+        "astro.config.mjs": (
+            "import { defineConfig } from 'astro/config';\nimport starlight from '@astrojs/starlight';\n"
+            "export const locales = { root: { label: 'English', lang: 'en' }, de: { label: 'Deutsch' } };\n"
+            "export default defineConfig({\n  integrations: [\n    starlight({\n      title: 'Docs',\n"
+            "      locales,\n      sidebar: [\n"
+            "        { label: 'Start Here', translations: { de: 'Hier' }, items: ['getting-started', "
+            "{ label: 'Setup Guide', slug: 'manual-setup' }] },\n"
+            "        { label: 'Guides', items: [{ autogenerate: { directory: 'guides' } }] },\n"
+            "      ],\n    }),\n  ],\n});\n"),
+        "src/content/docs/index.mdx": "---\ntitle: Welcome\n---\nHi.\n",
+        "src/content/docs/getting-started.mdx": "---\ntitle: Getting Started\n---\nGo.\n",
+        "src/content/docs/manual-setup.mdx": "---\ntitle: Manual Setup\n---\nSet.\n",
+        "src/content/docs/guides/b.md": "---\ntitle: B guide\n---\nB.\n",
+        "src/content/docs/guides/a.md": "---\ntitle: A guide\n---\nA.\n",
+        "src/content/docs/de/getting-started.mdx": "---\ntitle: Erste Schritte\n---\nLos.\n"})
+    cases.append(("starlight sidebar", tmp / "nav-starlight" / "src" / "content" / "docs", "index.html",
+                  "astro.config.mjs sidebar",
+                  ["Welcome", "§Start Here", "Getting Started", "Setup Guide", "§Guides", "A guide", "B guide"]))
+
+    # VitePress: per-path sidebars, a helper function, base prefixes, rewrites and locales
+    write_files(tmp / "nav-vitepress", {
+        ".vitepress/config.mts": (
+            "import { defineConfig, type DefaultTheme } from 'vitepress'\n"
+            "export default defineConfig({\n  rewrites: { 'en/:rest*': ':rest*' },\n"
+            "  locales: { root: { label: 'English', lang: 'en-US' }, zh: { label: 'Chinese', lang: 'zh-Hans' } },\n"
+            "  themeConfig: {\n    sidebar: {\n"
+            "      '/guide/': { base: '/guide/', items: sidebarGuide() },\n"
+            "      '/reference/': [ { text: 'Reference', items: [ { text: 'CLI', link: '/reference/cli' } ] } ]\n"
+            "    }\n  }\n})\n\n"
+            "function sidebarGuide(): DefaultTheme.SidebarItem[] {\n  return [\n"
+            "    { text: 'Introduction', collapsed: false, items: [\n"
+            "      { text: 'What is it?', link: 'what-is-it' },\n"
+            "      { text: 'Getting Started', link: 'getting-started' }\n    ] },\n"
+            "    { text: 'Theme', base: '/guide/theme-', items: [ { text: 'Colors', link: 'colors' } ] }\n"
+            "  ]\n}\n"),
+        "en/index.md": "# Home\n", "en/guide/what-is-it.md": "# What\n",
+        "en/guide/getting-started.md": "# Start\n", "en/guide/theme-colors.md": "# Colours\n",
+        "en/reference/cli.md": "# CLI Reference\n", "zh/index.md": "# Shouye\n"})
+    cases.append(("vitepress sidebar", tmp / "nav-vitepress", "en/index.html", ".vitepress/config.mts sidebar",
+                  ["Home", "§Introduction", "What is it?", "Getting Started", "§Theme", "Colors",
+                   "§Reference", "CLI"]))
+
+    for name, src, page, source, expected in cases:
+        out = tmp / ("out-" + src.parent.name + "-" + src.name)
+        r = run_build(src, out)
+        if r.returncode != 0:
+            check(f"{name}: build succeeds", False, (r.stderr or r.stdout).strip()[-300:])
+            continue
+        check(f"{name}: banner names the source", f"Navigation:    {source}" in r.stdout,
+              r.stdout.strip()[-200:])
+        got = sidebar(out / "html" / page)
+        check(f"{name}: sidebar order", got == expected, f"got {got}")
+
+    check("starlight: translations are left out",
+          not (tmp / "out-content-docs" / "html" / "de").exists())
+    check("vitepress: translations are left out",
+          not (tmp / "out-nav-vitepress-nav-vitepress" / "html" / "zh").exists())
+    check("mdbook: SUMMARY.md is not a chapter",
+          not (tmp / "out-nav-mdbook-src" / "html" / "SUMMARY.html").exists())
+    check("jekyll: layouts and includes are not pages",
+          not (tmp / "out-nav-jekyll-nav-jekyll" / "html" / "_layouts").exists()
+          and not (tmp / "out-nav-jekyll-nav-jekyll" / "html" / "_includes").exists())
+    summary = (tmp / "out-nav-mkdocs-docs" / "markdown" / "SUMMARY.md").read_text(encoding="utf-8")
+    check("markdown SUMMARY shows sections", "- **Guide**" in summary and "  - [B](" in summary,
+          summary[:300])
+
+
+def test_wikilinks(tmp: Path) -> None:
+    print("wikilinks")
+    src, out = tmp / "vault", tmp / "out-vault"
+    png = bytes.fromhex(
+        "89504e470d0a1a0a0000000d4948445200000001000000010806000000"
+        "1f15c4890000000d4944415478da63f8cfc0f00f0005000100ffab8e36"
+        "890000000049454e44ae426082")
+    write_files(src, {
+        ".obsidian/app.json": "{}",
+        "Home.md": (
+            "# Home\n\nSee [[Target Note]], [[Target Note|an alias]], "
+            "[[Folder/Deep Note#Section Two]], [[#Local Heading]] and [[Missing Page]].\n\n"
+            "Inline code `[[not a link]]` stays.\n\n"
+            "| Where | Link |\n|---|---|\n| table | [[Target Note\\|piped alias]] |\n\n"
+            "![[diagram.png|300]]\n\n"
+            "![[Target Note#Part A]]\n\n"
+            "> [!tip]- Folded tip\n> MARKER_FOLD with [[Target Note]]\n\n"
+            "> [!note] See [[Folder/Deep Note|the deep note]] first\n> Body.\n\n"
+            "Formatted alias: [[Target Note|`code alias`]].\n\n"
+            "<details>\n<summary>More</summary>\n\n**MARKER_DETAILS**\n\n</details>\n\n"
+            "## Local Heading\n\nText.\n"),
+        "Target Note.md": "# Target Note\n\nIntro.\n\n## Part A\n\nMARKER_PART_A\n\n## Part B\n\nMARKER_PART_B\n",
+        "Folder/Deep Note.md": "# Deep Note\n\n## Section Two\n\nDeep.\n",
+        "Folder/Other.md": "# Other\n\nBack to [[Home]].\n"})
+    (src / "attachments").mkdir(parents=True, exist_ok=True)
+    (src / "attachments" / "diagram.png").write_bytes(png)
+    r = run_build(src, out)
+    if r.returncode != 0:
+        check("vault build succeeds", False, (r.stderr or r.stdout).strip()[-300:])
+        return
+    home = (out / "html" / "Home.html").read_text(encoding="utf-8").split("<main>", 1)[1].split("</main>", 1)[0]
+    check("wikilink resolves by name", 'href="Target Note.html"' in home, home[:400])
+    check("wikilink alias is the link text", ">an alias</a>" in home)
+    check("escaped alias pipe inside a table",
+          ">piped alias</a>" in home and "<td>" in home and "Target Note\\" not in home)
+    check("wikilink with folder and heading",
+          'href="Folder/Deep Note.html#section-two"' in home)
+    check("same-page heading link", 'href="#local-heading"' in home)
+    check("unresolved wikilink is marked missing",
+          'class="wikilink missing"' in home and "Missing Page" in home)
+    check("wikilinks in inline code are left alone", "<code>[[not a link]]</code>" in home)
+    check("image embed with width",
+          'src="attachments/diagram.png"' in home and 'width="300"' in home)
+    check("embedded image copied", (out / "html" / "attachments" / "diagram.png").is_file())
+    embed = home.split('class="embed"', 1)[-1] if 'class="embed"' in home else ""
+    check("note section is transcluded",
+          "MARKER_PART_A" in embed and "MARKER_PART_B" not in home, embed[:300])
+    check("foldable callout becomes details",
+          '<details class="admonition tip"' in home and "Folded tip</summary>" in home
+          and "MARKER_FOLD" in home)
+    check("wikilink inside a callout resolves",
+          home.count('href="Target Note.html"') >= 2)
+    title = home.split('class="admonition-title">', 1)[-1].split("</p>", 1)[0]
+    check("wikilink in a callout title becomes a link",
+          'href="Folder/Deep Note.html"' in title and ">the deep note</a>" in title, title)
+    check("inline code inside a wikilink alias",
+          "<code>code alias</code></a>" in home)
+    check("markdown inside <details> renders", "<strong>MARKER_DETAILS</strong>" in home)
+    other = (out / "html" / "Folder" / "Other.html").read_text(encoding="utf-8")
+    check("wikilink from a subfolder climbs out", 'href="../Home.html"' in other)
+    broken = broken_links(out / "html")
+    check("every vault link resolves", not broken, "; ".join(broken[:4]))
+    md = (out / "markdown" / "Home.md").read_text(encoding="utf-8")
+    check("markdown book gets plain links", "[an alias](<Target Note.md>)" in md, md[:300])
+
+
+def test_templates(tmp: Path) -> None:
+    print("templates")
+
+    def main_of(path: Path) -> str:
+        return path.read_text(encoding="utf-8").split("<main>", 1)[1].split("</main>", 1)[0]
+
+    # Hugo shortcodes
+    site = tmp / "hugo-site"
+    write_files(site, {
+        "hugo.toml": "title = 'Site'\n",
+        "content/_index.md": "---\ntitle: Home\n---\nWelcome to {{< param title >}}.\n\n{{< new-in 0.140.0 />}}\n",
+        "content/docs/guide.md": (
+            "---\ntitle: Guide\n---\n"
+            "{{< hint warning >}}\nMARKER_HINT with **bold**\n{{< /hint >}}\n\n"
+            '{{< details title="More info" >}}\nMARKER_DETAILS\n{{< /details >}}\n\n'
+            '{{< tabs >}}\n{{< tab "macOS" >}}\nMARKER_MAC\n{{< /tab >}}\n{{< /tabs >}}\n\n'
+            '{{< highlight go >}}\nfunc main() { fmt.Println("{{ not a template }}") }\n{{< /highlight >}}\n\n'
+            "{{< code-toggle file=hugo >}}\n[params]\nx = 1\n{{< /code-toggle >}}\n\n"
+            "{{< code-toggle config=imaging />}}\n\nMARKER_AFTER_SELF_CLOSING\n\n"
+            '{{< img\n  src="shot.png"\n  alt="A screenshot"\n>}}\n\n'
+            '{{% render-table-of-pages-in-section\n  path="/functions"\n%}}\n\n'
+            "1. A step with config:\n\n    {{< code-toggle file=hugo >}}\n    baseURL = 'x'\n    {{< /code-toggle >}}\n\n"
+            'See [the home]({{< ref "/_index.md" >}}) and [setup]({{< relref "setup" >}}).\n\n'
+            '{{% include "/_common/snippet.md" %}}\n\n'
+            "{{< youtube 0RKpf3rK57I >}}\n\n"
+            '{{< mystery-shortcode foo="bar" />}}\n\n'
+            "Escaped: `{{</* hint */>}}` and {{</* note */>}} literal.\n"),
+        "content/docs/setup.md": "# Setup\n",
+        "content/_common/snippet.md": "MARKER_INCLUDED from a shared file.\n"})
+    out = tmp / "out-hugo-site"
+    r = run_build(site / "content", out)
+    if r.returncode != 0:
+        check("hugo build succeeds", False, (r.stderr or r.stdout).strip()[-300:])
+    else:
+        guide = main_of(out / "html" / "docs" / "guide.html")
+        check("hint shortcode becomes a callout",
+              'class="admonition warning"' in guide and "MARKER_HINT" in guide
+              and "<strong>bold</strong>" in guide, guide[:300])
+        check("details shortcode becomes details",
+              "<details" in guide and "More info</summary>" in guide and "MARKER_DETAILS" in guide)
+        check("tab shortcode becomes a labelled section",
+              'class="tab-label">macOS' in guide and "MARKER_MAC" in guide)
+        check("highlight shortcode becomes highlighted code",
+              'class="highlight"' in guide and "not a template" in guide)
+        check("code-toggle content stays code", "[params]" in guide.split("<pre", 2)[-1])
+        check("a self-closing code shortcode doesn't swallow the page",
+              "<p>MARKER_AFTER_SELF_CLOSING</p>" in guide, guide[-600:])
+        check("a multi-line shortcode is read whole",
+              'alt="A screenshot"' in guide and "render-table" not in guide, guide[:500])
+        check("a code shortcode inside a list item stays in the item",
+              re.search(r"<li>.*?baseURL.*?</li>", guide, re.S) is not None)
+        check("ref and relref become links",
+              'href="../_index.html"' in guide and 'href="setup.html"' in guide)
+        check("include shortcode inlines the file", "MARKER_INCLUDED" in guide)
+        check("youtube shortcode becomes a link",
+              'href="https://www.youtube.com/watch?v=0RKpf3rK57I"' in guide)
+        check("unknown shortcodes are removed", "mystery" not in guide and "{{&lt;" not in
+              guide.replace("{{&lt; hint &gt;}}", "").replace("{{&lt; note &gt;}}", ""))
+        check("escaped shortcodes stay literal",
+              "{{&lt; hint &gt;}}" in guide and "{{&lt; note &gt;}}" in guide, guide[-400:])
+        home = main_of(out / "html" / "_index.html")
+        check("param shortcode reads front matter", "Welcome to Home." in home, home[:200])
+        check("new-in shortcode becomes a badge", 'class="badge">New in 0.140.0' in home)
+        broken = broken_links(out / "html")
+        check("every hugo link resolves", not broken, "; ".join(broken[:4]))
+
+    # Jekyll: Liquid expressions, links, includes, comments, raw and highlight blocks
+    write_files(tmp / "jekyll-site", {
+        "_config.yml": "title: My Site\nbaseurl: /base\n",
+        "_includes/note.md": "MARKER_INCLUDE_MD\n",
+        "_includes/badge.html": '<span class="site-badge">{{ site.title }}</span>\n',
+        "_includes/loop.html": "{% for x in site.data %}MARKER_LOOP{{ x }}{% endfor %}\n",
+        "_docs/conduct.md": "---\ntitle: Conduct\npermalink: /docs/conduct/\n---\nBe nice.\n",
+        "_posts/2016-07-26-launch.md": "---\ntitle: Launch\n---\nLaunched.\n",
+        "about.html": ("---\ntitle: About Us\npermalink: /about/\n---\n<h1>{{ page.title }}</h1>\n"
+                       "<p><a href=\"{{ 'docs/conduct/' | relative_url }}\">Conduct</a></p>\n"),
+        "index.md": (
+            "---\ntitle: Home Page\n---\n# {{ page.title }} for {{ site.title }}\n\n"
+            "Read the [code of conduct]({{ '/docs/conduct/' | relative_url }}), "
+            "[the launch]({% post_url 2016-07-26-launch %}) and "
+            "[conduct again]({% link _docs/conduct.md %}).\n\n"
+            "{% include note.md %}\n\n{% include badge.html %}\n\n{% include loop.html %}\n\n"
+            "{% comment %}\nMARKER_COMMENT_HIDDEN\n{% endcomment %}\n\n"
+            "{% if site.title %}MARKER_IF_BODY{% endif %}\n\n"
+            '{% highlight ruby %}\ndef hello; puts "{% raw %}{{ not_liquid }}{% endraw %}"; end\n{% endhighlight %}\n\n'
+            "```liquid\n{% raw %}\n{{ page.title }} stays literal\n{% endraw %}\n```\n")})
+    out = tmp / "out-jekyll-site"
+    r = run_build(tmp / "jekyll-site", out)
+    if r.returncode != 0:
+        check("jekyll build succeeds", False, (r.stderr or r.stdout).strip()[-300:])
+    else:
+        home = main_of(out / "html" / "index.html")
+        body = home.split('<nav class="pager">', 1)[0]   # the pager links pages too
+        check("liquid page and site variables", ">Home Page for My Site</h1>" in home, home[:300])
+        check("relative_url and link tags resolve to pages",
+              body.count('href="_docs/conduct.html"') == 2, body[:600])
+        check("post_url resolves", 'href="_posts/2016-07-26-launch.html"' in home)
+        check("markdown include inlined", "MARKER_INCLUDE_MD" in home)
+        check("static html include inlined with variables", 'class="site-badge">My Site' in home)
+        check("looping template fragment skipped", "MARKER_LOOP" not in home)
+        check("liquid comment hidden", "MARKER_COMMENT_HIDDEN" not in home)
+        check("control tags vanish, their content stays", "MARKER_IF_BODY" in home and "{%" not in home)
+        check("highlight tag becomes code with raw content kept",
+              'class="highlight"' in home and "{{ not_liquid }}" in home)
+        # highlighting splits the text into spans, so compare it with the tags removed
+        check("raw block inside a fence stays literal",
+              "{{ page.title }} stays literal" in re.sub(r"<[^>]+>", "", home))
+        about = main_of(out / "html" / "about.html")
+        check("jekyll html page: front matter and liquid",
+              "<h1>About Us</h1>" in about and 'href="_docs/conduct.html"' in about
+              and "permalink" not in about, about[:300])
+        broken = broken_links(out / "html")
+        check("every jekyll link resolves", not broken, "; ".join(broken[:4]))
+
+    # MkDocs: mkdocs-macros variables and includes, pymdownx.snippets
+    write_files(tmp / "macros-site", {
+        "mkdocs.yml": ("site_name: Macro Docs\nplugins:\n  - search\n  - macros:\n"
+                       "      include_dir: snippets_inc\nmarkdown_extensions:\n"
+                       "  - pymdownx.snippets:\n      base_path: [shared]\n"
+                       "extra:\n  version: 2.4.1\n  product:\n    name: Widget\n"),
+        "docs/index.md": (
+            "# {{ config.site_name }}\n\nVersion {{ version }} of {{ product.name }}.\n\n"
+            '{% include "partial.md" %}\n\n--8<-- "common.md"\n\n;--8<-- "escaped.md"\n\n'
+            "--8<--\nmulti1.md\nmulti2.md\n--8<--\n\n{% raw %}{{ kept }}{% endraw %}\n"),
+        "snippets_inc/partial.md": "MARKER_MACRO_INCLUDE\n",
+        "shared/common.md": "MARKER_SNIPPET\n",
+        "shared/multi1.md": "MARKER_MULTI1\n", "shared/multi2.md": "MARKER_MULTI2\n"})
+    out = tmp / "out-macros-site"
+    r = run_build(tmp / "macros-site" / "docs", out)
+    if r.returncode != 0:
+        check("macros build succeeds", False, (r.stderr or r.stdout).strip()[-300:])
+    else:
+        home = main_of(out / "html" / "index.html")
+        check("macros: config and extra variables",
+              ">Macro Docs</h1>" in home and "Version 2.4.1 of Widget." in home, home[:300])
+        check("macros: include from include_dir", "MARKER_MACRO_INCLUDE" in home)
+        check("snippets: single and block forms",
+              "MARKER_SNIPPET" in home and "MARKER_MULTI1" in home and "MARKER_MULTI2" in home)
+        check("snippets: escaped marker stays literal", "--8&lt;--" in home)
+        check("macros: raw block kept", "{{ kept }}" in home)
+
+    # MDX components (Docusaurus and Starlight)
+    write_files(tmp / "mdx-site", {
+        "page.mdx": (
+            "---\ntitle: Components\n---\n"
+            "import Tabs from '@theme/Tabs';\nimport TabItem from '@theme/TabItem';\n"
+            "import { Aside, Steps, LinkCard } from '@astrojs/starlight/components';\n\n"
+            "{/* a comment that must vanish */}\n\n"
+            "<Tabs>\n  <TabItem\n    value=\"npm\"\n    label=\"npm\">\n\n```bash\nnpm install\n```\n\n  </TabItem>\n</Tabs>\n\n"
+            '<Aside type="caution" title="Careful now">\n\tMARKER_ASIDE with [a link](other.md)\n</Aside>\n\n'
+            "<Steps>\n\n1. MARKER_STEP\n\n</Steps>\n\n"
+            '<LinkCard title="Read more" href="https://example.com" />\n\n'
+            "<BrowserWindow>\n\nMARKER_WINDOW\n\n</BrowserWindow>\n\n"
+            "<FancyWidget foo={1} />\n\n"
+            '```js title="src/example.js" {2} showLineNumbers\nconst MARKER_TITLED = 1;\n```\n\n'
+            '<Aside type="tip">MARKER_ONE_LINE</Aside>\n\n'
+            'Status: <Badge text="New" variant="tip" /> and <URLPath /> here.\n\n'
+            "<SidebarPreview\n  config={[\n    { label: 'A', link: () => '/a' },\n  ]}\n/>\n\n"
+            "MARKER_AFTER_PREVIEW\n"),
+        "other.md": "# Other\n"})
+    out = tmp / "out-mdx-site"
+    r = run_build(tmp / "mdx-site", out)
+    if r.returncode != 0:
+        check("mdx build succeeds", False, (r.stderr or r.stdout).strip()[-300:])
+        return
+    page = main_of(out / "html" / "page.html")
+    check("mdx comments vanish", "comment that must vanish" not in page)
+    check("TabItem with a multi-line tag becomes a label",
+          'class="tab-label">npm' in page and 'class="highlight"' in page, page[:400])
+    check("Aside becomes a callout with its title",
+          'class="admonition caution"' in page and "Careful now" in page
+          and "MARKER_ASIDE" in page and 'href="other.html"' in page)
+    check("tab-indented component content is not a code block",
+          "MARKER_ASIDE" not in "".join(re.findall(r"<pre.*?</pre>", page, re.S)))
+    check("Steps content renders as a list", re.search(r"<li>\s*MARKER_STEP", page) is not None)
+    check("LinkCard becomes a link",
+          'href="https://example.com"' in page and ">Read more</a>" in page)
+    check("unknown wrapper components are unwrapped", "<p>MARKER_WINDOW</p>" in page)
+    check("no JSX tags leak into the page",
+          not re.search(r"</?(Tabs|TabItem|Aside|Steps|BrowserWindow|FancyWidget|URLPath)\b", page))
+    check("code block title from the info string",
+          'class="code-title">src/example.js' in page
+          and re.search(r'code-title.*?class="highlight".*?MARKER_TITLED', page, re.S) is not None)
+    check("one-line component becomes a callout",
+          re.search(r'class="admonition tip".*?MARKER_ONE_LINE', page, re.S) is not None)
+    check("inline Badge keeps its text", 'class="badge">New</span>' in page)
+    check("a multi-line live demo with arrow functions is dropped",
+          "SidebarPreview" not in page and "<p>MARKER_AFTER_PREVIEW</p>" in page, page[-400:])
+
 
 def write_docs_systems_fixture(root: Path) -> None:
     """One source per docs-system dialect bookify is expected to read as-is."""
@@ -518,7 +963,11 @@ def installed_chromium() -> "str | None":
     """
     roots = [Path.home() / "Library/Caches/ms-playwright",          # macOS
              Path.home() / ".cache/ms-playwright"]                   # Linux
+    if os.environ.get("LOCALAPPDATA"):                               # Windows
+        roots.append(Path(os.environ["LOCALAPPDATA"]) / "ms-playwright")
     names = ("chrome-headless-shell", "headless_shell", "chrome", "Chromium")
+    if os.name == "nt":
+        names = tuple(n + ".exe" for n in names)
     found: list[tuple[int, str]] = []
     for root in roots:
         if not root.is_dir():
@@ -869,6 +1318,48 @@ def test_browser(tmp: Path) -> None:
         else:
             check("map node found for drag test", False, "no node under the cursor")
 
+        # full-text search
+        page.goto(s.url + "/README.html")
+        page.wait_for_timeout(400)
+        page.keyboard.press("Control+k")
+        page.wait_for_selector("#searchbox:not([hidden]) input", timeout=5000)
+        page.keyboard.type("marker_alt")
+        page.wait_for_function(
+            "()=>document.querySelectorAll('#searchbox li[data-i]').length>0", timeout=5000)
+        check("search finds text on another page",
+              page.evaluate("()=>document.querySelector('#searchbox li[data-i]')"
+                            ".textContent.includes('Alt Page')"))
+        check("search marks the matched words",
+              page.evaluate("()=>!!document.querySelector('#searchbox li[data-i] mark')"))
+        page.keyboard.press("Enter")
+        page.wait_for_url("**/guide/alt.html*", timeout=5000)
+        page.wait_for_timeout(500)
+        check("a result opens its page with the terms highlighted",
+              page.evaluate("()=>CSS.highlights.has('bk-search')"
+                            "&&CSS.highlights.get('bk-search').size>0"))
+        page.keyboard.press("Control+k")
+        page.wait_for_timeout(250)
+        check("search remembers the last query",
+              page.evaluate("()=>document.querySelector('#searchbox input').value==='marker_alt'"))
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(250)
+        check("escape closes search", page.evaluate("()=>document.getElementById('searchbox').hidden"))
+
+        # a large book's shared sidebar is filled in by script, current page marked
+        with Serve(src, tmp / "out-ui-shared", "--no-ask",
+                   env={"BOOKIFY_INLINE_NAV_LIMIT": "1"}) as shared:
+            page.goto(shared.url + "/guide/page.html")
+            page.wait_for_timeout(500)
+            check("shared sidebar is filled in",
+                  page.evaluate("()=>document.querySelectorAll('nav.sidebar .tree a').length>=3"))
+            check("shared sidebar marks the current page and opens its folder",
+                  page.evaluate("()=>{const a=document.querySelector('nav.sidebar .tree a.active');"
+                                "return !!a && a.getAttribute('href')==='../guide/page.html'"
+                                "&& a.closest('details').open}"))
+            check("shared sidebar links resolve from a subfolder",
+                  page.evaluate("()=>[...document.querySelectorAll('nav.sidebar .tree a')]"
+                                ".some(a=>a.href.endsWith('/README.html'))"))
+
         check("no uncaught page errors", not errors, "; ".join(errors[:3]))
         browser.close()
 
@@ -898,6 +1389,9 @@ def main() -> int:
         write_fixture(tmp / "src")
         test_build(tmp)
         test_docs_systems(tmp)
+        test_navigation(tmp)
+        test_wikilinks(tmp)
+        test_templates(tmp)
         test_annotations(tmp)
         test_ask(tmp)
         if args.browser:
