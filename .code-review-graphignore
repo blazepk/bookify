@@ -1,0 +1,14 @@
+node_modules/
+dist/
+build/
+out/
+coverage/
+.next/
+.turbo/
+.expo/
+vendor/
+*.min.js
+*.map
+pnpm-lock.yaml
+package-lock.json
+yarn.lock

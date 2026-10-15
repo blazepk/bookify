@@ -2,3 +2,7 @@ __pycache__/
 *.pyc
 .DS_Store
 /out/
+# Added by code-review-graph
+.code-review-graph/
+# Machine-specific MCP config (absolute paths), written by code-review-graph
+.mcp.json
