@@ -917,8 +917,16 @@ def test_diagrams_and_artifacts(tmp: Path) -> None:
     src, out = tmp / "src-diagrams", tmp / "out-diagrams"
     write_files(src, DIAGRAM_BOOK)
     (tmp / "outside.html").write_text("<title>Outside</title>", encoding="utf-8")
+    # the valid blocks alone build cleanly
+    good = tmp / "src-diagrams-good"
+    write_files(good, {k: v for k, v in DIAGRAM_BOOK.items() if k != "system/more.md"})
+    rg = run_build(good, tmp / "out-diagrams-good")
+    check("a valid diagram and artifact book exits 0 with no error",
+          rg.returncode == 0 and "error" not in rg.stderr, rg.stderr[-300:])
     r = run_build(src, out)
-    check("diagram book builds", r.returncode == 0, r.stderr[-300:])
+    check("a book with malformed artifact blocks exits non-zero",
+          r.returncode == 1 and "5 malformed block(s)" in r.stderr, f"{r.returncode} {r.stderr[-300:]}")
+    check("the error names the page", "system/more.md: Artifact block:" in r.stderr, r.stderr[-300:])
     html = out / "html"
     layers = (html / "system" / "layers.html").read_text(encoding="utf-8")
 
@@ -1020,7 +1028,7 @@ def test_diagrams_and_artifacts(tmp: Path) -> None:
     check("a bad block still shows its source", "colour: red" in more)
 
     # --- an artifact opened on its own keeps the iframe's sandbox
-    with Serve(src, tmp / "out-diagrams-serve") as s:
+    with Serve(good, tmp / "out-diagrams-serve") as s:
         req = urllib.request.urlopen(s.url + "/artifacts/probe.html", timeout=10)
         check("served artifact carries a sandbox header, so it has no book origin on its own",
               req.headers.get("Content-Security-Policy") == "sandbox allow-scripts")

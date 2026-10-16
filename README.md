@@ -260,9 +260,11 @@ height: 640
 ````
 
 `src` (a relative path to an `.html` file) and `title` are required; `height` is
-an integer from 200 to 1200 (default 600). Unknown keys, a bad height, or a
-missing or outside `src` are reported as a warning on stderr and shown on the page
-in place of the frame. The block becomes an iframe with `sandbox="allow-scripts"`
+an integer from 200 to 1200 (default 600). A malformed block (unknown key, bad
+height, missing, remote or outside `src`) fails the build: stderr names the page and
+the problem, the page shows the block's source in an error box instead of a frame,
+and bookify exits with status 1 without serving. The rest of the book is still
+written. The block becomes an iframe with `sandbox="allow-scripts"`
 and nothing else, so the artifact has an opaque origin: it cannot reach the book
 page, its notes, its storage or the Ask AI token. The local server sends the same
 sandbox as a header when the artifact is opened on its own. The artifact and the

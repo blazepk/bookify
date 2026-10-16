@@ -103,6 +103,8 @@ ARTIFACT_REF_EXTS = ASSET_EXTS | {".css", ".js", ".mjs", ".json"}
 # the page being rendered, for the artifact fence (a fence formatter only
 # receives its own text); set by render_page
 _FENCE_CTX: dict = {"page": None, "root": None}
+# malformed blocks found this run; any makes the build exit non-zero
+FENCE_ERRORS: list[str] = []
 FENCE_OPEN = re.compile(r"^[ \t]*(`{3,}|~{3,})[ \t]*([^\s`]*)[^`]*$")
 
 
@@ -186,7 +188,8 @@ def _fence_mermaid(source, language, class_name, options, md, **kwargs):
 
 def _fence_error(what: str, why: str, source: str, page) -> str:
     where = f"{page.rel.as_posix()}: " if page is not None else ""
-    print(f"bookify: warning: {where}{what}: {why}", file=sys.stderr)
+    FENCE_ERRORS.append(f"{where}{what}: {why}")
+    print(f"bookify: error: {where}{what}: {why}", file=sys.stderr)
     return (f'<div class="bk-fence-error" role="alert"><p><strong>{html_mod.escape(what)}:'
             f'</strong> {html_mod.escape(why)}</p><pre><code>{html_mod.escape(source)}'
             f'</code></pre></div>')
@@ -4223,6 +4226,12 @@ def main() -> int:
     n_assets = copy_assets(collect_assets(pages, root), *dests) if dests else 0
     print(f"{len(pages)} pages rendered"
           + (f", {n_assets} assets copied." if n_assets else "."))
+    if FENCE_ERRORS:
+        # the book is already written (each bad block shown as an error box,
+        # nothing embedded); fail so a broken book is never mistaken for a good one
+        print(f"bookify: {len(FENCE_ERRORS)} malformed block(s); exiting with an error",
+              file=sys.stderr)
+        return 1
 
     if not args.no_serve and args.format in ("html", "both"):
         import functools
