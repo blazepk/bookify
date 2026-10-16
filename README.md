@@ -241,6 +241,35 @@ Ollama on another port or machine.
 > **Note:** the CLI backends spend whatever quota that CLI is on. `--no-ask`
 > disables the feature; `--ask-provider ollama` keeps everything local.
 
+### Diagrams and embedded artifacts
+
+A fenced `mermaid` block is drawn as a diagram in the HTML book. The renderer is
+a pinned Mermaid build bundled in `assets/vendor/mermaid/` (MIT licence and
+provenance beside it), copied into the book only when a page has a diagram, so
+diagrams work offline and over `file://`. If a diagram cannot be drawn, the page
+shows its source instead.
+
+A fenced `artifact` block embeds a self-contained HTML file:
+
+````md
+```artifact
+src: ../artifacts/task-graph.html
+title: Task dependency graph
+height: 640
+```
+````
+
+`src` (a relative path to an `.html` file) and `title` are required; `height` is
+an integer from 200 to 1200 (default 600). Unknown keys, a bad height, or a
+missing or outside `src` are reported as a warning on stderr and shown on the page
+in place of the frame. The block becomes an iframe with `sandbox="allow-scripts"`
+and nothing else, so the artifact has an opaque origin: it cannot reach the book
+page, its notes, its storage or the Ask AI token. The local server sends the same
+sandbox as a header when the artifact is opened on its own. The artifact and the
+files it references by relative path are copied into the output, unchanged and not
+rendered as a page; it is searchable by its title and is a node in the book map.
+`--format md` keeps both kinds of block as written.
+
 ### Search
 
 `Ctrl K` (`⌘K` on a Mac), or the Search button, searches the text of every page.

@@ -21,6 +21,7 @@ The --browser suite needs the Playwright Python package and a browser:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -883,6 +884,215 @@ def test_annotations(tmp: Path) -> None:
     check("no temp file left behind", not list(out.glob("*.tmp")))
 
 
+MERMAID_SHA256 = "581ed7d74bd9048d0e3a91363927d72ef22942d7722546b27f7cc29e35390eb8"
+ARTIFACT_HTML = (
+    "<!doctype html><html><head><meta charset=utf-8><title>Probe</title>"
+    '<link rel="stylesheet" href="probe.css"></head><body>'
+    "<script>document.title='ran'</script></body></html>")
+DIAGRAM_BOOK = {
+    "SUMMARY.md": "# Summary\n\n- [Layers](system/layers.md)\n- [Plain](plain.md)\n",
+    "plain.md": "# Plain\n\nNo diagram here. See [layers](system/layers.md).\n",
+    "system/layers.md": (
+        "# Layers\n\n```mermaid\nflowchart LR\n  A[<b>UI</b>] --> B[Pi]\n```\n\n"
+        "In words: UI calls Pi.\n\n"
+        "```artifact\nsrc: ../artifacts/probe.html\ntitle: Probe \"one\"\nheight: 320\n```\n\n"
+        "In words: a probe.\n\n"
+        "```artifact\nsrc: ../artifacts/probe.html\ntitle: Probe again\n```\n\n"
+        "````md\n```artifact\nsrc: ../artifacts/quoted.html\ntitle: Quoted\n```\n````\n"),
+    "system/more.md": (
+        "# More\n\n```artifact\nsrc: ../artifacts/probe.html\ntitle: Probe\n```\n\n"
+        "```artifact\nsrc: ../artifacts/probe.html\ntitle: Bad\ncolour: red\n```\n\n"
+        "```artifact\nsrc: ../artifacts/probe.html\ntitle: Tall\nheight: 5000\n```\n\n"
+        "```artifact\nsrc: ../artifacts/missing.html\ntitle: Missing\n```\n\n"
+        "```artifact\nsrc: ../../outside.html\ntitle: Outside\n```\n\n"
+        "```artifact\nsrc: https://example.com/x.html\ntitle: Remote\n```\n"),
+    "artifacts/probe.html": ARTIFACT_HTML,
+    "artifacts/probe.css": "body{color:red}",
+    "artifacts/quoted.html": "<title>Quoted</title>",
+}
+
+
+def test_diagrams_and_artifacts(tmp: Path) -> None:
+    print("mermaid and artifacts")
+    src, out = tmp / "src-diagrams", tmp / "out-diagrams"
+    write_files(src, DIAGRAM_BOOK)
+    (tmp / "outside.html").write_text("<title>Outside</title>", encoding="utf-8")
+    r = run_build(src, out)
+    check("diagram book builds", r.returncode == 0, r.stderr[-300:])
+    html = out / "html"
+    layers = (html / "system" / "layers.html").read_text(encoding="utf-8")
+
+    # --- Mermaid
+    check("mermaid block becomes a diagram placeholder holding its escaped source",
+          '<pre class="mermaid">flowchart LR\n  A[&lt;b&gt;UI&lt;/b&gt;] --&gt; B[Pi]</pre>' in layers,
+          layers[layers.find("mermaid") - 20:][:200])
+    check("renderer and init scripts load by relative path, so file:// works",
+          'src="../_vendor/mermaid/mermaid.min.js"' in layers
+          and 'src="../mermaid-init.js"' in layers
+          and layers.index("mermaid.min.js") < layers.index("mermaid-init.js")
+          < layers.index("book.js"))
+    check("renderer is the pinned bundled build",
+          hashlib.sha256((html / "_vendor/mermaid/mermaid.min.js").read_bytes()).hexdigest()
+          == MERMAID_SHA256)
+    check("renderer ships with its licence notice",
+          "MIT License" in (html / "_vendor/mermaid/LICENSE").read_text(encoding="utf-8")
+          and (html / "_vendor/mermaid/README.md").is_file())
+    init = (html / "mermaid-init.js").read_text(encoding="utf-8")
+    check("init script falls back to the source on any failure",
+          "could not be drawn" in init and "item.src" in init
+          and "did not load" in init and ".catch(" in init)
+    check("a page without a diagram loads no renderer",
+          "mermaid" not in (html / "plain.html").read_text(encoding="utf-8"))
+    run_build(tmp / "src", tmp / "out-nodiagram")
+    check("a book without a diagram copies no renderer",
+          (tmp / "out-nodiagram" / "html" / "book.js").is_file()
+          and not (tmp / "out-nodiagram" / "html" / "_vendor").exists()
+          and not (tmp / "out-nodiagram" / "html" / "mermaid-init.js").exists())
+    check("copy buttons skip diagrams",
+          "main pre:not(.mermaid)" in (html / "book.js").read_text(encoding="utf-8"))
+
+    # --- artifact iframe
+    m = re.search(r'<iframe [^>]*title="Probe &quot;one&quot;"[^>]*>', layers)
+    check("artifact becomes an iframe", m is not None)
+    tag = m.group(0) if m else ""
+    check("iframe is sandboxed with allow-scripts and nothing else",
+          'sandbox="allow-scripts"' in tag and tag.count("sandbox=") == 1, tag)
+    check("iframe is not given same-origin access, so it cannot reach the book page, "
+          "its notes or the Ask AI token",
+          "allow-same-origin" not in layers
+          and "allow-same-origin" not in (html / "system/more.html").read_text(encoding="utf-8"))
+    check("iframe is lazy, titled, and has the given height",
+          'loading="lazy"' in tag and 'height="320"' in tag
+          and 'src="../artifacts/probe.html"' in tag, tag)
+    check("height defaults to 600",
+          re.search(r'<iframe [^>]*title="Probe again"[^>]*height="600"', layers) is not None)
+    check("a link opens the artifact on its own",
+          'href="../artifacts/probe.html" target="_blank" rel="noopener">Open' in layers)
+    check("a quoted example in a longer fence stays text",
+          layers.count("<iframe") == 2 and "quoted.html" in layers
+          and (html / "artifacts" / "quoted.html").is_file())   # an unembedded .html stays a page
+
+    # --- copied as is, not rendered as a page
+    copied = html / "artifacts" / "probe.html"
+    check("artifact is copied verbatim with its script",
+          copied.read_text(encoding="utf-8") == ARTIFACT_HTML)
+    check("a file the artifact references is copied beside it",
+          (html / "artifacts" / "probe.css").read_text(encoding="utf-8") == "body{color:red}")
+    check("artifact is not also a book page",
+          "probe" not in "".join(sidebar(html / "plain.html")).lower()
+          and "Probe" not in (html / "index.html").read_text(encoding="utf-8"))
+    check("copied into the Markdown book too",
+          (out / "markdown" / "artifacts" / "probe.html").is_file())
+
+    # --- search and map
+    search = (html / "search.js").read_text(encoding="utf-8")
+    docs = json.loads(search[len("window.BOOKIFY_SEARCH="):].rstrip(";\n"))
+    probe = [d for d in docs if d["t"] == 'Probe "one"']
+    check("artifact is searchable under its title, opening the page that embeds it",
+          len(probe) == 1 and probe[0]["u"] == "system/layers.html"
+          and probe[0]["p"][0][0] in layers, str(probe)[:200])
+    gm = re.search(r"const G=(\{.*?\});\nconst cv", (html / "__map__.html").read_text(encoding="utf-8"),
+                   re.S)
+    graph = json.loads(gm.group(1)) if gm else {"nodes": [], "edges": []}
+    nodes = [n for n in graph["nodes"] if n["kind"] == "artifact"]
+    check("artifact is a node in the book map",
+          [n["id"] for n in nodes] == ["artifacts/probe.html"]
+          and nodes[0]["href"] == "artifacts/probe.html", str(nodes))
+    check("the map links the artifact to each page that embeds it",
+          {e["s"] for e in graph["edges"] if e["t"] == "artifacts/probe.html"}
+          == {"system/layers.html", "system/more.html"})
+
+    # --- markdown output keeps both blocks as written
+    md = (out / "markdown" / "system" / "layers.md").read_text(encoding="utf-8")
+    check("--format md keeps the mermaid block as written",
+          "```mermaid\nflowchart LR\n  A[<b>UI</b>] --> B[Pi]\n```" in md, md[:200])
+    check("--format md keeps the artifact block as written",
+          '```artifact\nsrc: ../artifacts/probe.html\ntitle: Probe "one"\nheight: 320\n```' in md)
+
+    # --- bad blocks are loud, never an iframe
+    more = (html / "system" / "more.html").read_text(encoding="utf-8")
+    check("only the valid artifact block makes an iframe", more.count("<iframe") == 1)
+    for what in ("unknown key 'colour'", "height must be an integer from 200 to 1200",
+                 "does not exist", "points outside the book folder",
+                 "must be a relative path ending in .html"):
+        check(f"bad artifact block says why: {what}",
+              what in more.replace("&#x27;", "'") and what in r.stderr, r.stderr[-300:])
+    check("a bad block still shows its source", "colour: red" in more)
+
+    # --- an artifact opened on its own keeps the iframe's sandbox
+    with Serve(src, tmp / "out-diagrams-serve") as s:
+        req = urllib.request.urlopen(s.url + "/artifacts/probe.html", timeout=10)
+        check("served artifact carries a sandbox header, so it has no book origin on its own",
+              req.headers.get("Content-Security-Policy") == "sandbox allow-scripts")
+        req.close()
+        req = urllib.request.urlopen(s.url + "/system/layers.html", timeout=10)
+        check("book pages carry no such header",
+              req.headers.get("Content-Security-Policy") is None)
+        req.close()
+
+
+def test_browser_diagrams(tmp: Path) -> None:
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return
+    print("browser diagrams and artifacts")
+    src, out = tmp / "src-browser-diagrams", tmp / "out-browser-diagrams"
+    probe = ("<!doctype html><title>Probe</title><p id=r>wait</p><script>"
+             "var o=[];try{o.push('parent '+window.parent.document.title)}catch(e){o.push('parent blocked')}"
+             "try{o.push('storage '+localStorage.length)}catch(e){o.push('storage blocked')}"
+             "fetch('/__ask__').then(function(r){return r.text()}).then(function(t){o.push('ask '+t.slice(0,20))})"
+             ".catch(function(){o.push('ask blocked')}).then(function(){"
+             "document.getElementById('r').textContent=o.join('|')})</script>")
+    write_files(src, {
+        "page.md": ("# Page\n\n```mermaid\nflowchart LR\n  A --> B\n```\n\n"
+                    "```mermaid\nflowchart LR\n  A --> --> ((B\n```\n\n"
+                    "```artifact\nsrc: probe.html\ntitle: Probe\nheight: 220\n```\n"),
+        "probe.html": probe})
+    with Serve(src, out) as s, sync_playwright() as pw:
+        try:
+            browser = pw.chromium.launch()
+        except Exception:                                    # noqa: BLE001
+            exe = installed_chromium()
+            if not exe:
+                print("browser: skipped, no chromium available")
+                return
+            browser = pw.chromium.launch(executable_path=exe)
+        for label, url in (("http", s.url + "/page.html"),
+                           ("file", (out / "html" / "page.html").as_uri())):
+            page = browser.new_page()
+            page.goto(url)
+            page.wait_for_function("document.querySelectorAll('.mermaid-failed').length>0"
+                                   " && document.querySelectorAll('pre.mermaid svg').length>0",
+                                   timeout=20000)
+            check(f"{label}: a valid diagram is drawn as SVG",
+                  page.locator("pre.mermaid svg").count() == 1)
+            check(f"{label}: a broken diagram shows its source",
+                  "A --&gt; --&gt; ((B" in page.locator(".mermaid-failed pre").inner_html()
+                  or "A --> --> ((B" in page.locator(".mermaid-failed pre").inner_text())
+            frame = page.frame_locator("iframe")
+            frame.locator("#r").wait_for()
+            page.wait_for_function("document.querySelector('iframe').contentWindow!==null")
+            got = ""
+            for _ in range(50):
+                got = frame.locator("#r").inner_text()
+                if got != "wait":
+                    break
+                page.wait_for_timeout(100)
+            check(f"{label}: the artifact runs but cannot reach the page or storage",
+                  got.startswith("parent blocked|storage blocked|ask"), got)
+            if label == "http":
+                check("http: the artifact cannot read the Ask AI token endpoint",
+                      "ask blocked" in got and "token" not in got, got)
+                page.goto(s.url + "/probe.html")
+                page.wait_for_function("document.getElementById('r').textContent!=='wait'")
+                alone = page.locator("#r").inner_text()
+                check("http: opened on its own it is still cut off from the book's origin",
+                      "storage blocked" in alone and "ask blocked" in alone, alone)
+            page.close()
+        browser.close()
+
+
 def test_ask(tmp: Path) -> None:
     print("ask ai api")
     src = tmp / "src"
@@ -1392,10 +1602,12 @@ def main() -> int:
         test_navigation(tmp)
         test_wikilinks(tmp)
         test_templates(tmp)
+        test_diagrams_and_artifacts(tmp)
         test_annotations(tmp)
         test_ask(tmp)
         if args.browser:
             test_browser(tmp)
+            test_browser_diagrams(tmp)
 
     took = time.time() - started
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed in {took:.1f}s")

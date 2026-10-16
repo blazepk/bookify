@@ -42,7 +42,7 @@ import posixpath
 import re
 import shutil
 import sys
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -87,6 +87,149 @@ MAX_ASSET_BYTES = 25 * 1024 * 1024
 # which would otherwise grow the book with the square of its size
 NAV_INLINE_LIMIT = int(os.environ.get("BOOKIFY_INLINE_NAV_LIMIT", "400"))
 
+# ----------------------------------------------------------------------------
+# Mermaid diagrams and embedded HTML artifacts (fenced blocks)
+
+# the bundled renderer; a copy of its MIT licence sits next to it
+MERMAID_DIR = Path(__file__).resolve().parent / "assets" / "vendor" / "mermaid"
+MERMAID_FILES = ("mermaid.min.js", "LICENSE", "README.md")
+MERMAID_MARK = '<pre class="mermaid"'
+ARTIFACT_KEYS = ("src", "title", "height")
+ARTIFACT_DEFAULT_HEIGHT = 600
+ARTIFACT_HEIGHTS = (200, 1200)
+# what an artifact may pull in from beside it (it is meant to be one file, but
+# anything it does reference is copied the way images are)
+ARTIFACT_REF_EXTS = ASSET_EXTS | {".css", ".js", ".mjs", ".json"}
+# the page being rendered, for the artifact fence (a fence formatter only
+# receives its own text); set by render_page
+_FENCE_CTX: dict = {"page": None, "root": None}
+FENCE_OPEN = re.compile(r"^[ \t]*(`{3,}|~{3,})[ \t]*([^\s`]*)[^`]*$")
+
+
+def iter_fences(text: str):
+    """Yield (info string, body text) for each fenced block, outermost only, so
+    a block quoted inside a longer fence (the way a format guide shows an
+    example) is not mistaken for a real one."""
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        m = FENCE_OPEN.match(lines[i])
+        if not m:
+            i += 1
+            continue
+        fence, info = m.group(1), m.group(2).lower()
+        close = re.compile(r"^[ \t]*" + re.escape(fence[0]) + "{" + str(len(fence)) + r",}[ \t]*$")
+        j, body = i + 1, []
+        while j < len(lines) and not close.match(lines[j]):
+            body.append(lines[j])
+            j += 1
+        yield info, "\n".join(body)
+        i = j + 1
+
+
+def parse_artifact_block(body: str) -> tuple[dict, list[str]]:
+    """The key: value lines of an artifact block -> (fields, errors)."""
+    fields: dict[str, str] = {}
+    errors: list[str] = []
+    for raw in body.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        key, sep, value = line.partition(":")
+        key, value = key.strip().lower(), value.strip()
+        if not sep or not key:
+            errors.append(f"not a key: value line: {line!r}")
+        elif key not in ARTIFACT_KEYS:
+            errors.append(f"unknown key {key!r} (allowed: {', '.join(ARTIFACT_KEYS)})")
+        elif key in fields:
+            errors.append(f"duplicate key {key!r}")
+        else:
+            fields[key] = value
+    for need in ("src", "title"):
+        if not fields.get(need):
+            errors.append(f"missing required key {need!r}")
+    if "height" in fields:
+        lo, hi = ARTIFACT_HEIGHTS
+        h = fields["height"]
+        if not re.fullmatch(r"\d{1,5}", h) or not lo <= int(h) <= hi:
+            errors.append(f"height must be an integer from {lo} to {hi}, got {h!r}")
+    src = fields.get("src", "")
+    if src and (not src.lower().endswith(".html") or re.match(r"[a-z][a-z0-9+.-]*:|//", src, re.I)):
+        errors.append(f"src must be a relative path ending in .html, got {src!r}")
+    return fields, errors
+
+
+def artifact_key(page_rel: Path, src: str) -> str:
+    """Root-relative posix path of an artifact a page embeds."""
+    page_dir = page_rel.parent.as_posix()
+    page_dir = "" if page_dir == "." else page_dir
+    return posixpath.normpath(posixpath.join(page_dir, unquote(src)))
+
+
+def embedded_artifact_keys(page_rel: Path, body: str) -> set[str]:
+    """Artifact files a Markdown page embeds, so they are not also made into
+    pages (a page render would strip their scripts)."""
+    keys = set()
+    for info, block in iter_fences(body):
+        if info == "artifact":
+            fields, _ = parse_artifact_block(block)
+            if fields.get("src"):
+                keys.add(artifact_key(page_rel, fields["src"]))
+    return keys
+
+
+def _fence_mermaid(source, language, class_name, options, md, **kwargs):
+    # the source stays as text in the page; the page script swaps in the SVG,
+    # or shows the source when rendering fails
+    return f'{MERMAID_MARK}>{html_mod.escape(source)}</pre>'
+
+
+def _fence_error(what: str, why: str, source: str, page) -> str:
+    where = f"{page.rel.as_posix()}: " if page is not None else ""
+    print(f"bookify: warning: {where}{what}: {why}", file=sys.stderr)
+    return (f'<div class="bk-fence-error" role="alert"><p><strong>{html_mod.escape(what)}:'
+            f'</strong> {html_mod.escape(why)}</p><pre><code>{html_mod.escape(source)}'
+            f'</code></pre></div>')
+
+
+def _fence_artifact(source, language, class_name, options, md, **kwargs):
+    page, root = _FENCE_CTX["page"], _FENCE_CTX["root"]
+    fields, errors = parse_artifact_block(source)
+    if page is None or root is None:
+        errors.append("an artifact can only be embedded in a Markdown page")
+    key = ""
+    if not errors:
+        key = artifact_key(page.rel, fields["src"])
+        target = root / key
+        try:
+            inside = root.resolve() in target.resolve().parents
+            if key.startswith("..") or not inside:
+                errors.append(f"src {fields['src']!r} points outside the book folder")
+            elif not target.is_file():
+                errors.append(f"src {fields['src']!r} does not exist")
+            elif target.stat().st_size > MAX_ASSET_BYTES:
+                errors.append(f"src {fields['src']!r} is too large to copy")
+        except OSError as exc:
+            errors.append(f"src {fields['src']!r} is unreadable: {exc}")
+    if errors:
+        return _fence_error("Artifact block", "; ".join(errors), source, page)
+    title = fields["title"]
+    height = int(fields.get("height") or ARTIFACT_DEFAULT_HEIGHT)
+    out_dir = posixpath.dirname(page.out_rel_html.as_posix()) or "."
+    href = quote(posixpath.relpath(key, out_dir), safe="/")
+    fig_id = "artifact-" + re.sub(r"[^a-z0-9]+", "-", key.lower()).strip("-")
+    page.artifacts.append({"key": key, "title": title, "height": height, "id": fig_id})
+    t = html_mod.escape(title, quote=True)
+    # sandbox="allow-scripts" and nothing else: no allow-same-origin, so the
+    # artifact gets an opaque origin and cannot reach the book page, its notes,
+    # its storage or the Ask AI token
+    return (f'<figure class="bk-artifact" id="{fig_id}">'
+            f'<iframe src="{href}" title="{t}" sandbox="allow-scripts" loading="lazy" '
+            f'height="{height}" style="height:{height}px"></iframe>'
+            f'<figcaption><a href="{href}" target="_blank" rel="noopener">'
+            f'Open &ldquo;{html_mod.escape(title)}&rdquo; on its own</a></figcaption></figure>')
+
+
 # "extra" minus fenced_code, which superfences replaces so code blocks also work
 # inside admonitions, tabs and list items; the pymdownx set covers GitHub-style
 # task lists, strikethrough and bare links plus Material for MkDocs' tabs and
@@ -99,6 +242,10 @@ MD_RENDERER = md_lib.Markdown(
                 "pymdownx.magiclink"],
     extension_configs={
         "pymdownx.highlight": {"css_class": "highlight", "guess_lang": False},
+        "pymdownx.superfences": {"custom_fences": [
+            {"name": "mermaid", "class": "mermaid", "format": _fence_mermaid},
+            {"name": "artifact", "class": "artifact", "format": _fence_artifact},
+        ]},
         "pymdownx.tabbed": {"alternate_style": True},
         "pymdownx.tilde": {"subscript": False},
     },
@@ -117,6 +264,8 @@ class Page:
     meta: dict = field(default_factory=dict, repr=False, compare=False)  # front matter
     html_body: str = ""
     md_body: str = ""
+    # artifacts this page embeds: {key, title, height, id}, filled by render_page
+    artifacts: list = field(default_factory=list, repr=False, compare=False)
     # prev/next are cyclic and link_* are derived: comparing them would make
     # Page.__eq__ recurse through the whole book
     prev: "Page | None" = field(default=None, repr=False, compare=False)
@@ -396,6 +545,7 @@ def collect_pages(root: Path, include_code: bool) -> list[Page]:
     skip = SKIP_DIRS | (JEKYLL_INTERNALS if (root / "_config.yml").is_file() else set())
     if (root / ".vitepress").is_dir():
         skip = skip | {"public"}   # VitePress copies public/ verbatim; it holds no pages
+    embedded: set[str] = set()
     for path in sorted(root.rglob("*")):
         if not path.is_file():
             continue
@@ -429,6 +579,7 @@ def collect_pages(root: Path, include_code: bool) -> list[Page]:
             meta, body = split_front_matter(text)
             title = meta.get("title") or first_heading(body) or fallback_title(rel)
             order = front_matter_order(meta)
+            embedded |= embedded_artifact_keys(rel, body)
         elif kind == "rst":
             title = rst_title(text) or fallback_title(rel)
         elif kind == "html":
@@ -441,6 +592,9 @@ def collect_pages(root: Path, include_code: bool) -> list[Page]:
         pages.append(Page(src=path, rel=rel, title=title, kind=kind, lang=lang or "",
                           order=order, meta=meta))
 
+    # an embedded artifact is copied as it is, never rendered as a page (which
+    # would strip its scripts)
+    pages = [p for p in pages if not (p.kind == "html" and p.rel.as_posix() in embedded)]
     pages.sort(key=lambda p: (tuple(str(x).lower() for x in p.rel.parts[:-1]),
                               sort_key(p.rel, p.order)))
     assign_out_paths(pages)
@@ -1366,6 +1520,40 @@ def collect_assets(pages: list[Page], root: Path) -> dict[str, Path]:
             except OSError:
                 continue
             found[key] = src
+    for page in pages:
+        for art in page.artifacts:
+            src = root / art["key"]
+            found[art["key"]] = src
+            found.update(artifact_refs(src, art["key"], root_resolved))
+    return found
+
+
+def artifact_refs(src: Path, key: str, root_resolved: Path) -> dict[str, Path]:
+    """Files an artifact points at with a relative path (script, stylesheet,
+    image), so they are copied beside it. Absolute URLs are left alone."""
+    try:
+        text = src.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {}
+    refs = re.findall(r"""(?:src|href)\s*=\s*["']([^"']+)["']""", text, re.I)
+    refs += re.findall(r"""url\(\s*["']?([^)"']+)""", text, re.I)
+    found: dict[str, Path] = {}
+    base = posixpath.dirname(key)
+    for ref in refs:
+        if ref.startswith(SKIP_HREF) or ref.startswith("//"):
+            continue
+        path = ref.partition("#")[0].partition("?")[0]
+        if not path or Path(path).suffix.lower() not in ARTIFACT_REF_EXTS:
+            continue
+        rkey = posixpath.normpath(posixpath.join(base, unquote(path)))
+        f = root_resolved / rkey
+        try:
+            if (rkey.startswith("..") or not f.is_file() or f.stat().st_size > MAX_ASSET_BYTES
+                    or root_resolved not in f.resolve().parents):
+                continue
+        except OSError:
+            continue
+        found[rkey] = f
     return found
 
 
@@ -2097,7 +2285,11 @@ def render_rst(text: str) -> str | None:
 def render_page(page: Page, html_map: dict[str, str], md_map: dict[str, str],
                 links: "WikiLinks | None" = None, templates: "Templates | None" = None) -> None:
     text = page.src.read_text(encoding="utf-8", errors="replace")
+    page.artifacts = []
     if page.kind == "md":
+        # the artifact fence resolves its src against this page
+        _FENCE_CTX["page"] = page
+        _FENCE_CTX["root"] = page.src.parents[len(page.rel.parts) - 1]
         meta, body = split_front_matter(text)
         mdx = page.src.suffix.lower() == ".mdx"
         if templates:
@@ -2107,7 +2299,11 @@ def render_page(page: Page, html_map: dict[str, str], md_map: dict[str, str],
         if meta.get("title") and not re.match(r"#\s", source.lstrip()):
             source = f"# {meta['title']}\n\n{source}"
         MD_RENDERER.reset()
-        page.html_body = rewrite_md_links(MD_RENDERER.convert(source), page, html_map)
+        try:
+            converted = MD_RENDERER.convert(source)
+        finally:
+            _FENCE_CTX["page"] = _FENCE_CTX["root"] = None
+        page.html_body = rewrite_md_links(converted, page, html_map)
         plain = normalize_markdown(body, mdx=mdx, callouts=False, links=links, page=page)
         page.md_body = rewrite_links_for_md_book(plain, page, md_map)
     elif page.kind == "rst":
@@ -2260,6 +2456,16 @@ main del{{color:var(--muted)}}
 main mark{{background:var(--hl);color:inherit;padding:0 .15em;border-radius:3px}}
 main figure{{margin:1.5rem 0;text-align:center}}
 main figure p{{margin:0}}
+main figure.bk-artifact{{text-align:left}}
+main .bk-artifact iframe{{display:block;width:100%;border:1px solid var(--border);
+border-radius:8px;background:var(--paper)}}
+main .bk-artifact figcaption{{text-align:right}}
+main pre.mermaid{{background:transparent;border:0;overflow:auto}}
+main pre.mermaid.mermaid-done{{text-align:center;white-space:normal;font-family:var(--sans)}}
+main pre.mermaid svg{{max-width:100%;height:auto}}
+main .bk-fence-error,main .mermaid-failed{{margin:1.3rem 0;padding:.1rem 1rem;
+border-left:3px solid #C4453C;background:var(--panel)}}
+main .mermaid-failed p{{font-family:var(--sans);font-size:.85rem;color:var(--muted)}}
 main figcaption{{font-family:var(--sans);font-size:.82rem;color:var(--muted);margin-top:.45rem}}
 main .wikilink.missing{{color:var(--muted);border-bottom:1px dashed var(--muted);cursor:help}}
 main .embed{{margin:1.3rem 0;padding:.15rem 0 .15rem 1.1rem;border-left:3px solid var(--border)}}
@@ -2592,7 +2798,7 @@ a.classList.add('active');})},{rootMargin:'0px 0px -70% 0px'});
 hs.forEach(h=>io.observe(h));})();
 
 // ---- copy buttons on code blocks ----
-(()=>{document.querySelectorAll('main pre').forEach(pre=>{
+(()=>{document.querySelectorAll('main pre:not(.mermaid)').forEach(pre=>{
 const wrap=document.createElement('div');wrap.className='codewrap';
 pre.parentNode.insertBefore(wrap,pre);wrap.appendChild(pre);
 const b=document.createElement('button');b.type='button';b.className='copy';
@@ -3206,6 +3412,62 @@ def _contains(tree: dict, page: Page) -> bool:
                for c in tree["children"])
 
 
+# Draws each <pre class="mermaid"> with the bundled renderer. Every failure path
+# (renderer missing, bad syntax, a throw while drawing) ends the same way: the
+# diagram's source is shown instead, so the page never loses the content.
+MERMAID_INIT = r"""(function () {
+  var items = [].slice.call(document.querySelectorAll('pre.mermaid')).map(function (el) {
+    return { el: el, src: el.textContent };
+  });
+  if (!items.length) return;
+  function fail(item, why) {
+    var box = document.createElement('div');
+    box.className = 'mermaid-failed';
+    var note = document.createElement('p');
+    note.textContent = 'This diagram could not be drawn (' + why + '). Its source:';
+    var pre = document.createElement('pre'), code = document.createElement('code');
+    code.textContent = item.src;
+    pre.appendChild(code);
+    box.appendChild(note);
+    box.appendChild(pre);
+    if (item.el.parentNode) item.el.parentNode.replaceChild(box, item.el);
+  }
+  var m = window.mermaid;
+  if (!m || typeof m.render !== 'function' || typeof m.parse !== 'function') {
+    items.forEach(function (i) { fail(i, 'the diagram renderer did not load'); });
+    return;
+  }
+  var root = document.documentElement, t = root.getAttribute('data-theme');
+  var dark = t ? t === 'dark' : !!(window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches);
+  try {
+    m.initialize({ startOnLoad: false, securityLevel: 'strict', theme: dark ? 'dark' : 'default' });
+  } catch (e) {
+    items.forEach(function (i) { fail(i, 'the renderer would not start'); });
+    return;
+  }
+  var n = 0;
+  items.reduce(function (chain, item) {
+    return chain.then(function () {
+      var id = 'bk-mermaid-' + (n++);
+      return Promise.resolve(m.parse(item.src)).then(function () {
+        return m.render(id, item.src);
+      }).then(function (r) {
+        item.el.innerHTML = r.svg;
+        item.el.classList.add('mermaid-done');
+        item.el.setAttribute('role', 'img');
+        item.el.setAttribute('aria-label', 'Diagram; the text below it describes it');
+        if (r.bindFunctions) r.bindFunctions(item.el);
+      }).catch(function (e) {
+        var stray = document.getElementById('d' + id);   // the renderer's own error box
+        if (stray && stray.parentNode) stray.parentNode.removeChild(stray);
+        fail(item, e && e.message ? String(e.message).split('\n')[0].slice(0, 160) : 'invalid syntax');
+      });
+    });
+  }, Promise.resolve());
+})();
+"""
+
+
 def write_html_book(pages: list[Page], tree: dict, out: Path, title: str,
                     book_id: str = "") -> None:
     light_hl = HtmlFormatter(style="default").get_style_defs(".highlight")
@@ -3222,6 +3484,17 @@ def write_html_book(pages: list[Page], tree: dict, out: Path, title: str,
     out.mkdir(parents=True, exist_ok=True)
     (out / "book.css").write_text(CSS + "\n" + hl_css, encoding="utf-8")
     (out / "book.js").write_text(JS, encoding="utf-8")
+    if any(MERMAID_MARK in p.html_body for p in pages):
+        # offline and file://-safe: a classic script beside the pages, with its licence
+        vendor = out / "_vendor" / "mermaid"
+        vendor.mkdir(parents=True, exist_ok=True)
+        for name in MERMAID_FILES:
+            if (MERMAID_DIR / name).is_file():
+                shutil.copyfile(MERMAID_DIR / name, vendor / name)
+            else:
+                print(f"bookify: warning: {MERMAID_DIR / name} is missing; "
+                      "diagrams will show their source", file=sys.stderr)
+        (out / "mermaid-init.js").write_text(MERMAID_INIT, encoding="utf-8")
     shared_nav = len(pages) > NAV_INLINE_LIMIT
     if shared_nav:
         import json as jsonlib
@@ -3237,6 +3510,9 @@ def write_html_book(pages: list[Page], tree: dict, out: Path, title: str,
         tree_html = "" if shared_nav else nav_html(tree, page, to_root)
         tree_attr = ' data-shared="1"' if shared_nav else ""
         nav_script = f'<script src="{to_root}nav.js" defer></script>' if shared_nav else ""
+        if MERMAID_MARK in page.html_body:   # deferred scripts run in order: renderer, then book.js
+            nav_script += (f'<script src="{to_root}_vendor/mermaid/mermaid.min.js" defer></script>'
+                           f'<script src="{to_root}mermaid-init.js" defer></script>')
         crumbs = '<span class="sep">/</span>'.join(html_mod.escape(c) for c in crumb_parts)
         pager = []
         if page.prev:
@@ -3324,12 +3600,32 @@ def search_sections(body_html: str, limit: int = 40000) -> list[list[str]]:
     return out
 
 
+def collect_artifacts(pages: list[Page]) -> dict[str, dict]:
+    """Embedded artifacts by file: {key: {title, id, key, pages: [embedding pages]}}.
+    The first title given to a file names it."""
+    found: dict[str, dict] = {}
+    for page in pages:
+        for art in page.artifacts:
+            entry = found.setdefault(art["key"], {**art, "pages": []})
+            if page not in entry["pages"]:
+                entry["pages"].append(page)
+    return found
+
+
 def write_search_index(pages: list[Page], out: Path) -> None:
     """search.js for the in-book search, as a script so it also works over file://."""
     import json as jsonlib
 
     docs = [{"t": p.title, "u": p.out_rel_html.as_posix(), "s": " › ".join(p.section),
              "p": search_sections(p.html_body)} for p in pages]
+    # an embedded artifact is found by its title; the hit opens the page that embeds it
+    for art in collect_artifacts(pages).values():
+        first = art["pages"][0]
+        docs.append({"t": art["title"], "u": first.out_rel_html.as_posix(),
+                     "s": "Artifact › " + " › ".join(p.title for p in art["pages"]),
+                     "p": [[art["id"], art["title"],
+                            f"Embedded artifact {art['key']}, shown on "
+                            + ", ".join(p.title for p in art["pages"])]]})
     (out / "search.js").write_text(
         "window.BOOKIFY_SEARCH=" + jsonlib.dumps(docs, ensure_ascii=False, separators=(",", ":")) + ";\n",
         encoding="utf-8")
@@ -3360,6 +3656,11 @@ def write_map_page(pages: list[Page], out: Path, title: str) -> None:
         pid = str(p.out_rel_html).replace("\\", "/")
         parent = "dir:" + "/".join(p.rel.parts[:-1]) if len(p.rel.parts) > 1 else ""
         edges.append({"s": parent, "t": pid, "kind": "tree"})
+    # an embedded artifact is a node, linked from each page that embeds it
+    for key, art in collect_artifacts(pages).items():
+        nodes.append({"id": key, "label": art["title"], "kind": "artifact", "href": key})
+        for p in art["pages"]:
+            edges.append({"s": str(p.out_rel_html).replace("\\", "/"), "t": key, "kind": "link"})
     seen = set()
     for p in pages:
         pid = str(p.out_rel_html).replace("\\", "/")
@@ -3396,7 +3697,7 @@ cv.style.width=W+'px';cv.style.height=H+'px'}}resize();
 // setting canvas.width clears the bitmap, so a resize must repaint or the map
 // goes blank until the next mouse move
 onresize=()=>{{resize();wake(0.1)}};
-const R={{root:16,dir:10,page:6}};
+const R={{root:16,dir:10,page:6,artifact:7}};
 const N=G.nodes.map((n,i)=>({{...n,
 x:W/2+Math.cos(i*2.4)*(60+i*7),y:H/2+Math.sin(i*2.4)*(60+i*7),vx:0,vy:0}}));
 const byId=new Map(N.map(n=>[n.id,n]));
@@ -3426,9 +3727,11 @@ ctx.strokeStyle=e.kind==='tree'?border:acc;
 ctx.globalAlpha=e.kind==='tree'?1:.45;
 ctx.setLineDash(e.kind==='link'?[4,4]:[]);ctx.lineWidth=1.2/zoom;ctx.stroke()}}
 ctx.setLineDash([]);ctx.globalAlpha=1;
-for(const n of N){{ctx.beginPath();ctx.arc(n.x,n.y,R[n.kind],0,7);
+for(const n of N){{ctx.beginPath();
+if(n.kind==='artifact')ctx.rect(n.x-R.artifact,n.y-R.artifact,2*R.artifact,2*R.artifact);
+else ctx.arc(n.x,n.y,R[n.kind],0,7);
 ctx.fillStyle=n.kind==='page'?muted:acc;ctx.fill();
-if(n===hover&&n.kind==='page'){{ctx.strokeStyle=acc;ctx.lineWidth=2/zoom;ctx.stroke()}}
+if(n===hover&&n.href){{ctx.strokeStyle=acc;ctx.lineWidth=2/zoom;ctx.stroke()}}
 ctx.fillStyle=n.kind==='root'?ink:n===hover?ink:muted;
 ctx.font=(n.kind==='root'?'700 14px':n.kind==='dir'?'600 12px':'11px')+' '+css('--sans');
 ctx.textAlign='center';ctx.fillText(n.label.slice(0,34),n.x,n.y+R[n.kind]+14)}}}}
@@ -4011,7 +4314,16 @@ def main() -> int:
                 tmp.replace(ann_path)
                 return db
 
+        # an artifact opened on its own would otherwise share the book's origin and
+        # could read the Ask AI token; the header gives it the iframe's sandbox
+        artifact_files = {a["key"] for p in pages for a in p.artifacts}
+
         class BookHandler(http.server.SimpleHTTPRequestHandler):
+            def end_headers(self):
+                if unquote(self.path.partition("?")[0]).lstrip("/") in artifact_files:
+                    self.send_header("Content-Security-Policy", "sandbox allow-scripts")
+                super().end_headers()
+
             def do_GET(self):
                 if self.path.startswith("/__annotations__"):
                     body = jsonlib.dumps(read_annotations()).encode()
