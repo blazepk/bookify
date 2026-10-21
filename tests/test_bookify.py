@@ -1057,6 +1057,12 @@ def test_browser_diagrams(tmp: Path) -> None:
                     "```mermaid\nflowchart LR\n  A --> --> ((B\n```\n\n"
                     "```artifact\nsrc: probe.html\ntitle: Probe\nheight: 220\n```\n"),
         "probe.html": probe})
+    wide = "flowchart LR\n" + "\n".join(
+        f'  A{i}["Readable stage {i} with a long label"] --> A{i+1}' for i in range(8))
+    original_code = 'const greeting = "' + ('long readable value ' * 25) + '";\nconsole.log(greeting);\n'
+    long_url = "https://example.invalid/" + "very-long-reference-path/" * 15
+    write_files(src, {"wide.md": "# Wide diagrams and code\n\n[" + long_url + "](" + long_url + ")\n\n```mermaid\n" + wide
+                     + "\n```\n\n```javascript\n" + original_code + "```\n"})
     with Serve(src, out) as s, sync_playwright() as pw:
         try:
             browser = pw.chromium.launch()
@@ -1097,6 +1103,45 @@ def test_browser_diagrams(tmp: Path) -> None:
                 alone = page.locator("#r").inner_text()
                 check("http: opened on its own it is still cut off from the book's origin",
                       "storage blocked" in alone and "ask blocked" in alone, alone)
+            page.goto(s.url + "/wide.html" if label == "http" else (out / "html" / "wide.html").as_uri())
+            page.wait_for_function("document.querySelector('pre.mermaid svg') && document.querySelector('.diagramwrap')")
+            svg = page.locator("pre.mermaid svg")
+            current_url = page.url
+            page.locator("pre.mermaid").focus()
+            page.locator("pre.mermaid").evaluate("e=>e.scrollLeft=160")
+            page.keyboard.press("ArrowLeft")
+            page.wait_for_function("document.querySelector('pre.mermaid') && document.querySelector('pre.mermaid').scrollLeft<160")
+            check(f"{label}: diagram arrow keys scroll without navigating away", page.url == current_url)
+            natural = svg.evaluate("e=>({width:e.getBoundingClientRect().width,natural:e.viewBox.baseVal.width})")
+            check(f"{label}: wide diagrams retain readable natural sizing", abs(natural["width"] - natural["natural"]) < 2, str(natural))
+            page.get_by_role("button", name="Fit diagram", exact=True).click()
+            fitted = svg.bounding_box()["width"]
+            check(f"{label}: fit contains the diagram in its viewport", fitted < natural["width"])
+            page.get_by_role("button", name="Actual size", exact=True).click()
+            page.get_by_role("button", name="Zoom in", exact=True).click()
+            check(f"{label}: zoom changes actual diagram size", svg.bounding_box()["width"] > natural["width"])
+            page.get_by_role("button", name="Expand diagram", exact=True).click()
+            check(f"{label}: expand opens a modal diagram viewer", page.locator("dialog[open] .mermaid svg").count() == 1)
+            page.keyboard.press("Escape")
+            page.wait_for_function("!document.querySelector('dialog')")
+            page.get_by_role("button", name="Expand diagram", exact=True).click()
+            page.get_by_role("button", name="Close diagram", exact=True).click()
+            page.wait_for_function("!document.querySelector('dialog')")
+            check(f"{label}: closing restores the diagram without duplicate controls", page.locator(".diagramwrap").count() == 1 and page.locator("dialog").count() == 0)
+            before_svg = svg.get_attribute("id")
+            page.evaluate("document.documentElement.setAttribute('data-theme','dark')")
+            page.wait_for_function("old=>document.querySelector('pre.mermaid svg').id!==old", arg=before_svg)
+            check(f"{label}: theme changes rerender diagrams without duplicating controls", page.locator(".diagramwrap").count() == 1 and page.locator(".mermaid-failed").count() == 0)
+            code = page.locator(".codewrap pre")
+            check(f"{label}: code whitespace and highlighting survive controls", code.text_content() == original_code and page.locator(".highlight .codewrap").count() == 1)
+            page.get_by_role("button", name="Wrap lines", exact=True).click()
+            check(f"{label}: wrapping changes layout without changing code", code.evaluate("e=>getComputedStyle(e).whiteSpace") == "pre-wrap" and code.text_content() == original_code)
+            page.evaluate("Object.defineProperty(navigator,'clipboard',{configurable:true,value:{writeText:t=>{window.copiedCode=t;return Promise.resolve()}}})")
+            page.get_by_role("button", name="Copy code", exact=True).click()
+            check(f"{label}: copy includes only original code", page.evaluate("window.copiedCode") == original_code)
+            page.set_viewport_size({"width": 390, "height": 844})
+            check(f"{label}: narrow pages contain diagrams, code and long links", page.evaluate("document.documentElement.scrollWidth<=innerWidth"))
+
             page.close()
         browser.close()
 

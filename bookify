@@ -2423,7 +2423,7 @@ overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
 .page-grid{{display:grid;grid-template-columns:minmax(0,1fr) var(--outline-w);
 gap:3rem;max-width:76rem;margin:0 auto;padding:0 2.2rem}}
 main{{font-family:var(--serif);font-size:1.0625rem;line-height:1.72;
-max-width:44rem;width:100%;margin:0 auto;padding:2.2rem 0 3rem;min-width:0}}
+max-width:44rem;width:100%;margin:0 auto;padding:2.2rem 0 3rem;min-width:0;overflow-wrap:anywhere}}
 main h1,main h2,main h3,main h4{{font-family:var(--serif);line-height:1.25;
 text-wrap:balance;font-weight:700;color:var(--ink)}}
 main h1{{font-size:1.95rem;margin:0 0 1.1rem;letter-spacing:-.01em;
@@ -2465,7 +2465,17 @@ border-radius:8px;background:var(--paper)}}
 main .bk-artifact figcaption{{text-align:right}}
 main pre.mermaid{{background:transparent;border:0;overflow:auto}}
 main pre.mermaid.mermaid-done{{text-align:center;white-space:normal;font-family:var(--sans)}}
-main pre.mermaid svg{{max-width:100%;height:auto}}
+main pre.mermaid svg{{max-width:none;height:auto;display:block;margin:0 auto}}
+.diagramwrap{{margin:1.3rem 0;border:1px solid var(--border);border-radius:8px;overflow:hidden;background:var(--paper)}}
+.block-toolbar{{display:flex;flex-wrap:wrap;align-items:center;justify-content:flex-end;gap:.35rem;padding:.4rem .55rem;background:var(--panel);border-bottom:1px solid var(--border);font-family:var(--sans)}}
+.block-toolbar button{{font:.78rem var(--sans);color:var(--ink);background:var(--paper);border:1px solid var(--border);border-radius:5px;padding:.3rem .55rem;cursor:pointer}}
+.block-toolbar button::after{{content:attr(data-label)}}
+.block-toolbar button[aria-pressed="true"]{{background:var(--tint);border-color:var(--accent)}}
+main .diagramwrap pre.mermaid{{margin:0;padding:.8rem;border-radius:0;min-height:0;overflow:auto}}
+.diagram-dialog{{width:calc(100vw - 2rem);max-width:none;height:calc(100vh - 2rem);max-height:none;padding:0;border:1px solid var(--border);border-radius:8px;background:var(--paper);color:var(--ink)}}
+.diagram-dialog::backdrop{{background:#0009}}
+.diagram-dialog .diagramwrap{{display:flex;flex-direction:column;height:100%;margin:0;border:0}}
+.diagram-dialog pre.mermaid{{flex:1}}
 main .bk-fence-error,main .mermaid-failed{{margin:1.3rem 0;padding:.1rem 1rem;
 border-left:3px solid #C4453C;background:var(--panel)}}
 main .mermaid-failed p{{font-family:var(--sans);font-size:.85rem;color:var(--muted)}}
@@ -2508,13 +2518,15 @@ main th,main td{{border:1px solid var(--border);padding:.5rem .85rem;text-align:
 main th{{background:var(--panel);font-weight:600}}
 main code{{font-family:var(--mono);font-size:.82em;background:var(--code-bg);
 padding:.14em .38em;border-radius:4px}}
-main pre{{font-family:var(--mono);font-size:.83rem;line-height:1.55;
+main pre{{font-family:var(--mono);font-size:.875rem;line-height:1.6;
 background:var(--code-bg);border:1px solid var(--border);border-radius:8px;
 padding:1rem 1.1rem;overflow-x:auto;margin:1.1rem 0}}
 main pre code{{background:none;padding:0;font-size:1em}}
 .plaintext{{white-space:pre-wrap}}
 .codewrap{{position:relative;margin:1.1rem 0}}
-.codewrap pre{{margin:0}}
+.codewrap pre{{margin:0;border-top:0;border-top-left-radius:0;border-top-right-radius:0}}
+.codewrap .block-toolbar{{border:1px solid var(--border);border-radius:8px 8px 0 0}}
+.codewrap.code-wrapped pre{{white-space:pre-wrap;overflow-wrap:anywhere}}
 .copy{{position:absolute;top:.55rem;right:.55rem;font:.72rem var(--sans);
 color:var(--muted);background:var(--paper);border:1px solid var(--border);
 border-radius:6px;padding:.25rem .6rem;cursor:pointer;opacity:0;transition:opacity .15s}}
@@ -2800,16 +2812,22 @@ list.querySelectorAll('a.active').forEach(x=>x.classList.remove('active'));
 a.classList.add('active');})},{rootMargin:'0px 0px -70% 0px'});
 hs.forEach(h=>io.observe(h));})();
 
-// ---- copy buttons on code blocks ----
+// ---- code blocks: controls have CSS labels so annotation text offsets stay stable ----
 (()=>{document.querySelectorAll('main pre:not(.mermaid)').forEach(pre=>{
 const wrap=document.createElement('div');wrap.className='codewrap';
-pre.parentNode.insertBefore(wrap,pre);wrap.appendChild(pre);
-const b=document.createElement('button');b.type='button';b.className='copy';
-b.setAttribute('aria-label','Copy code');
-b.addEventListener('click',()=>{
-navigator.clipboard.writeText(pre.innerText).then(()=>{b.classList.add('done');
-setTimeout(()=>b.classList.remove('done'),1200)}).catch(()=>{})});
-wrap.appendChild(b);});})();
+pre.parentNode.insertBefore(wrap,pre);
+const bar=document.createElement('div');bar.className='block-toolbar';
+wrap.appendChild(bar);wrap.appendChild(pre);pre.tabIndex=0;
+const button=(label)=>{const b=document.createElement('button');b.type='button';
+b.setAttribute('aria-label',label);b.dataset.label=label;bar.appendChild(b);return b};
+const lines=button('Wrap lines');lines.setAttribute('aria-pressed','false');
+lines.addEventListener('click',()=>{const on=wrap.classList.toggle('code-wrapped');lines.setAttribute('aria-pressed',String(on))});
+const copy=button('Copy code');
+copy.addEventListener('click',()=>{
+if(!navigator.clipboard)return;
+navigator.clipboard.writeText(pre.textContent).then(()=>{copy.dataset.label='Copied';
+setTimeout(()=>{copy.dataset.label='Copy code'},1200)}).catch(()=>{})});
+});})();
 
 // ---- search: Ctrl/Cmd+K opens a finder over every page's text. The index is a
 // script (search.js) rather than JSON so it loads when the book is opened off disk ----
@@ -2893,6 +2911,7 @@ addEventListener('keydown',e=>{if(e.key==='Escape')CSS.highlights.delete('bk-sea
 // ---- keyboard: arrows page through the book, "/" focuses the filter ----
 addEventListener('keydown',e=>{
 if(e.metaKey||e.ctrlKey||e.altKey||e.target.matches('input,textarea,select'))return;
+if(e.target.closest('.diagramwrap,.codewrap'))return;
 // paging away while the note editor or the chat is open would discard work
 if(document.querySelector('.bk-pop:not([hidden])'))return;
 if(document.body.classList.contains('ask-open'))return;
@@ -3420,55 +3439,93 @@ def _contains(tree: dict, page: Page) -> bool:
 # diagram's source is shown instead, so the page never loses the content.
 MERMAID_INIT = r"""(function () {
   var items = [].slice.call(document.querySelectorAll('pre.mermaid')).map(function (el) {
-    return { el: el, src: el.textContent };
+    return { el: el, src: el.textContent, scale: 1, mode: 'actual' };
   });
   if (!items.length) return;
   function fail(item, why) {
+    item.failed = true;
     var box = document.createElement('div');
     box.className = 'mermaid-failed';
     var note = document.createElement('p');
     note.textContent = 'This diagram could not be drawn (' + why + '). Its source:';
     var pre = document.createElement('pre'), code = document.createElement('code');
-    code.textContent = item.src;
-    pre.appendChild(code);
-    box.appendChild(note);
-    box.appendChild(pre);
+    code.textContent = item.src; pre.appendChild(code); box.appendChild(note); box.appendChild(pre);
     if (item.el.parentNode) item.el.parentNode.replaceChild(box, item.el);
   }
   var m = window.mermaid;
   if (!m || typeof m.render !== 'function' || typeof m.parse !== 'function') {
-    items.forEach(function (i) { fail(i, 'the diagram renderer did not load'); });
-    return;
+    items.forEach(function (i) { fail(i, 'the diagram renderer did not load'); }); return;
   }
-  var root = document.documentElement, t = root.getAttribute('data-theme');
-  var dark = t ? t === 'dark' : !!(window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches);
-  try {
-    m.initialize({ startOnLoad: false, securityLevel: 'strict', theme: dark ? 'dark' : 'default' });
-  } catch (e) {
-    items.forEach(function (i) { fail(i, 'the renderer would not start'); });
-    return;
+  function size(item) {
+    var svg = item.el.querySelector('svg'); if (!svg) return;
+    var vb = svg.viewBox.baseVal;
+    if (!(vb.width > 0 && vb.height > 0)) return;
+    var scale = item.mode === 'fit' ? Math.min(1, Math.max(1, item.el.clientWidth - 28) / vb.width) : item.scale;
+    svg.style.width = (vb.width * scale) + 'px';
+    svg.style.height = (vb.height * scale) + 'px';
+    svg.style.maxWidth = 'none';
   }
-  var n = 0;
-  items.reduce(function (chain, item) {
-    return chain.then(function () {
-      var id = 'bk-mermaid-' + (n++);
-      return Promise.resolve(m.parse(item.src)).then(function () {
-        return m.render(id, item.src);
-      }).then(function (r) {
-        item.el.innerHTML = r.svg;
-        item.el.classList.add('mermaid-done');
-        item.el.setAttribute('role', 'img');
-        item.el.setAttribute('aria-label', 'Diagram; the text below it describes it');
-        if (r.bindFunctions) r.bindFunctions(item.el);
-      }).catch(function (e) {
-        var stray = document.getElementById('d' + id);   // the renderer's own error box
-        if (stray && stray.parentNode) stray.parentNode.removeChild(stray);
-        fail(item, e && e.message ? String(e.message).split('\n')[0].slice(0, 160) : 'invalid syntax');
-      });
+  function viewer(item) {
+    if (item.wrap) { size(item); return; }
+    var wrap = document.createElement('div'), bar = document.createElement('div');
+    wrap.className = 'diagramwrap'; bar.className = 'block-toolbar';
+    item.el.parentNode.insertBefore(wrap, item.el); wrap.appendChild(bar); wrap.appendChild(item.el); item.wrap = wrap; item.el.tabIndex = 0;
+    function button(label, fn) {
+      var b = document.createElement('button'); b.type = 'button'; b.dataset.label = label;
+      b.setAttribute('aria-label', label); b.addEventListener('click', fn); bar.appendChild(b); return b;
+    }
+    button('Fit diagram', function () { item.mode = 'fit'; size(item); });
+    button('Actual size', function () { item.mode = 'actual'; item.scale = 1; size(item); });
+    button('Zoom out', function () { item.mode = 'actual'; item.scale = Math.max(.25, item.scale / 1.25); size(item); });
+    button('Zoom in', function () { item.mode = 'actual'; item.scale = Math.min(4, item.scale * 1.25); size(item); });
+    var expanded = button('Expand diagram', function () {
+      if (item.dialog) { item.dialog.close(); return; }
+      var marker = document.createComment('diagram position'), dialog = document.createElement('dialog');
+      dialog.className = 'diagram-dialog'; dialog.setAttribute('aria-label', 'Expanded diagram');
+      wrap.parentNode.insertBefore(marker, wrap); marker.parentNode.appendChild(dialog); dialog.appendChild(wrap);
+      item.dialog = dialog;
+      dialog.addEventListener('close', function () {
+        marker.parentNode.replaceChild(wrap, marker); item.dialog = null; dialog.remove();
+        expanded.dataset.label = 'Expand diagram'; expanded.setAttribute('aria-label', 'Expand diagram');
+        size(item); expanded.focus();
+      }, { once: true });
+      expanded.dataset.label = 'Close diagram'; expanded.setAttribute('aria-label', 'Close diagram');
+      dialog.showModal(); expanded.focus(); size(item);
     });
-  }, Promise.resolve());
+    size(item);
+  }
+  var root = document.documentElement, generation = 0, chain = Promise.resolve(), n = 0;
+  function renderAll() {
+    var version = ++generation;
+    chain = chain.then(function () {
+      if (version !== generation) return;
+      var t = root.getAttribute('data-theme');
+      var dark = t ? t === 'dark' : !!(window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches);
+      m.initialize({ startOnLoad: false, securityLevel: 'strict', theme: dark ? 'dark' : 'default' });
+      return items.reduce(function (work, item) {
+        return work.then(function () {
+          if (item.failed || version !== generation) return;
+          var id = 'bk-mermaid-' + (n++);
+          return Promise.resolve(m.parse(item.src)).then(function () { return m.render(id, item.src); }).then(function (r) {
+            if (version !== generation) return;
+            item.el.innerHTML = r.svg; item.el.classList.add('mermaid-done'); item.el.setAttribute('role', 'img');
+            item.el.setAttribute('aria-label', 'Diagram; the text below it describes it');
+            if (r.bindFunctions) r.bindFunctions(item.el); viewer(item);
+          }).catch(function (e) {
+            var stray = document.getElementById('d' + id); if (stray && stray.parentNode) stray.parentNode.removeChild(stray);
+            fail(item, e && e.message ? String(e.message).split('\n')[0].slice(0, 160) : 'invalid syntax');
+          });
+        });
+      }, Promise.resolve());
+    }).catch(function () { items.filter(function(i) { return !i.failed; }).forEach(function(i) { fail(i, 'the renderer would not start'); }); });
+  }
+  new MutationObserver(renderAll).observe(root, { attributes: true, attributeFilter: ['data-theme'] });
+  if (window.matchMedia) { var media = matchMedia('(prefers-color-scheme: dark)'); if (media.addEventListener) media.addEventListener('change', renderAll); }
+  window.addEventListener('resize', function () { items.forEach(size); });
+  renderAll();
 })();
 """
+
 
 
 def write_html_book(pages: list[Page], tree: dict, out: Path, title: str,

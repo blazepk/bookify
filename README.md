@@ -249,6 +249,15 @@ provenance beside it), copied into the book only when a page has a diagram, so
 diagrams work offline and over `file://`. If a diagram cannot be drawn, the page
 shows its source instead.
 
+Diagrams start at their natural size so wide diagrams keep readable labels. Scroll
+inside the diagram to see the rest, choose **Fit diagram** for an overview, or use
+**Zoom in** and **Zoom out**. **Expand diagram** opens a larger viewer; Escape or
+**Close diagram** returns to the page. Diagrams redraw when the reader's theme changes.
+
+Code blocks keep indentation and syntax highlighting. Their toolbar offers **Copy
+code** and **Wrap lines**. Wrapping changes only the display; copying preserves the
+original code, including line breaks and spaces.
+
 A fenced `artifact` block embeds a self-contained HTML file:
 
 ````md
